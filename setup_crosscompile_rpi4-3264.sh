@@ -1,590 +1,695 @@
 #!/bin/bash
 
-# Codes de couleur
+# ==============================================================================
+# Cross-compilation Qt 5.15.2 pour Raspberry Pi 4
+# Hôte    : Ubuntu 22.04 x86_64
+# Cible   : Raspberry Pi OS Bookworm 32 bits (armhf) ou 64 bits (arm64)
+#
+# Toolchain : gcc-arm-linux-gnueabihf
+# SQL       : QMYSQL (MariaDB) + SQLite intégré
+#
+# ==============================================================================
+
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+RED='\033[0;31m'
+NC='\033[0m'
 
-# =============================================
-# Configuration
-# =============================================
+# ==============================================================================
+# Configuration — adaptez ces valeurs à votre environnement
+# ==============================================================================
 RPI_USER="pi"
-RPI_HOST="10.0.2.3"  # Remplacez par l'IP de votre RPi4
+RPI_HOST="192.168.0.102"
 RPI_PORT="22"
 LOCAL_USER=$(whoami)
 LOCAL_GROUP=$(id -gn)
-CROSS_DIR="$HOME/cross_rpi4"  # Variable pour le nom du dossier sur le PC hôte
-TOOLCHAIN_URL_32="https://releases.linaro.org/components/toolchain/binaries/7.4-2019.02/arm-linux-gnueabihf/gcc-linaro-7.4.1-2019.02-x86_64_arm-linux-gnueabihf.tar.xz"
+CROSS_DIR="$HOME/cross_rpi4"
+SSH_KEY_PATH="$HOME/.ssh/id_rsa"
+
 QT_SRC_URL="http://download.qt.io/archive/qt/5.15/5.15.2/single/qt-everywhere-src-5.15.2.tar.xz"
 SYM_LINKER_URL="https://raw.githubusercontent.com/abhiTronix/raspberry-pi-cross-compilers/master/utils/SSymlinker"
 RELATIVE_LINKS_SCRIPT_URL="https://raw.githubusercontent.com/riscv/riscv-poky/master/scripts/sysroot-relativelinks.py"
-SSH_KEY_PATH="$HOME/.ssh/id_rsa"
 
-# Ces variables seront définies dynamiquement par detect_rpi_arch()
+# Variables remplies dynamiquement par detect_rpi_arch()
 ARCH_BITS=""
 CROSS_COMPILE_PREFIX=""
 QT_DEVICE=""
-TOOLCHAIN_BIN=""
+TOOLCHAIN_BIN="/usr/bin"
 MKSPEC_SRC=""
 MKSPEC_DST=""
-LINARO_DIR=""
+PKG_CONFIG_ARCH_PATH=""
+MYSQL_INCDIR=""
+MYSQL_LIBDIR=""
 
-# =============================================
-# Liste des modules Qt avec leurs versions
-# Format : "nom_du_module" -> "url:version"
-# =============================================
+# ==============================================================================
+# Modules Qt à compiler après qtbase
+# ==============================================================================
 declare -A QT_MODULES=(
-    ["qtbase"]="git://code.qt.io/qt/qtbase.git:5.15.2"
-    ["qtxmlpatterns"]="git://code.qt.io/qt/qtxmlpatterns.git:5.15.2"
-    ["qtsvg"]="git://code.qt.io/qt/qtsvg.git:5.15.2"
     ["qtdeclarative"]="git://code.qt.io/qt/qtdeclarative.git:5.15.2"
-    ["qtimageformats"]="git://code.qt.io/qt/qtimageformats.git:5.15.2"
-    ["qtgraphicaleffects"]="git://code.qt.io/qt/qtgraphicaleffects.git:5.15.2"
     ["qtquickcontrols"]="git://code.qt.io/qt/qtquickcontrols.git:5.15.2"
     ["qtquickcontrols2"]="git://code.qt.io/qt/qtquickcontrols2.git:5.15.2"
     ["qtvirtualkeyboard"]="git://code.qt.io/qt/qtvirtualkeyboard.git:5.15.2"
     ["qtwebsockets"]="git://code.qt.io/qt/qtwebsockets.git:5.15.2"
-    ["qtwebglplugin"]="git://code.qt.io/qt/qtwebglplugin.git:5.15.2"
     ["qtcharts"]="git://code.qt.io/qt/qtcharts.git:5.15.2"
     ["qtconnectivity"]="git://code.qt.io/qt/qtconnectivity.git:5.15.2"
-    ["qtmultimedia"]="git://code.qt.io/qt/qtmultimedia.git:5.15.2"
-    ["qtlocation"]="git://code.qt.io/qt/qtlocation.git:5.15.2"
     ["qtmqtt"]="git://code.qt.io/qt/qtmqtt.git:5.15.2"
     ["qtserialport"]="git://code.qt.io/qt/qtserialport.git:5.15.2"
 )
 
-# Modules à compiler (décommentez ceux que vous voulez)
 MODULES_TO_BUILD=(
-#    "qtxmlpatterns"
-#    "qtsvg"
     "qtdeclarative"
-#    "qtimageformats"
-#    "qtgraphicaleffects"
     "qtquickcontrols"
     "qtquickcontrols2"
     "qtvirtualkeyboard"
     "qtwebsockets"
-#    "qtwebglplugin"
     "qtcharts"
     "qtconnectivity"
-#    "qtmultimedia"
-#    "qtlocation"
     "qtmqtt"
     "qtserialport"
 )
 
-# =============================================
-# Fonctions utilitaires
-# =============================================
+# ==============================================================================
+# Utilitaires
+# ==============================================================================
 executer_locale() {
     echo -e "${GREEN}[LOCAL] $1${NC}"
     eval "$1"
     if [ $? -ne 0 ]; then
-        echo -e "${GREEN}Erreur lors de l'exécution locale : $1${NC}"
+        echo -e "${RED}[ERREUR LOCALE] $1${NC}"
         exit 1
     fi
 }
 
 executer_distante() {
-    echo -e "${BLUE}[SSH] Exécution sur $RPI_USER@$RPI_HOST:$RPI_PORT : $1${NC}"
+    echo -e "${BLUE}[SSH] $1${NC}"
     ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" "$1"
     if [ $? -ne 0 ]; then
-        echo -e "${BLUE}Erreur lors de l'exécution distante : $1${NC}"
+        echo -e "${RED}[ERREUR SSH] $1${NC}"
         exit 1
     fi
 }
 
-# =============================================
-# Détection de l'architecture du RPi
-# =============================================
+# ==============================================================================
+# Détection architecture du RPi
+# ==============================================================================
 detect_rpi_arch() {
-    echo -e "${YELLOW}=== Détection de l'architecture du RPi ===${NC}"
+    echo -e "${YELLOW}=== Détection architecture RPi ===${NC}"
 
     RPI_ARCH=$(ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" "uname -m" 2>/dev/null)
-
     if [ -z "$RPI_ARCH" ]; then
-        echo -e "${YELLOW}ERREUR : Impossible de détecter l'architecture du RPi (connexion SSH échouée ?).${NC}"
+        echo -e "${RED}ERREUR : impossible de joindre le RPi via SSH.${NC}"
         exit 1
     fi
+    RPI_DEB_ARCH=$(ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" \
+        "dpkg --print-architecture" 2>/dev/null)
 
-    # Double vérification via dpkg pour distinguer armhf/arm64
-    RPI_DEB_ARCH=$(ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" "dpkg --print-architecture" 2>/dev/null)
+    echo -e "${YELLOW}  uname -m                  : $RPI_ARCH${NC}"
+    echo -e "${YELLOW}  dpkg --print-architecture : $RPI_DEB_ARCH${NC}"
 
-    echo -e "${YELLOW}Architecture noyau  : $RPI_ARCH${NC}"
-    echo -e "${YELLOW}Architecture Debian : $RPI_DEB_ARCH${NC}"
-
-    if [[ "$RPI_ARCH" == "aarch64" ]] || [[ "$RPI_DEB_ARCH" == "arm64" ]]; then
-        # ---- 64 bits ----
+    if [[ "$RPI_DEB_ARCH" == "arm64" ]]; then
         ARCH_BITS=64
         CROSS_COMPILE_PREFIX="aarch64-linux-gnu-"
-        # Qt 5.15.2 ne fournit pas de device pour aarch64 RPi4 en natif.
-        # On utilise le device générique linux-aarch64-gnu-g++ et on crée le mkspec si besoin.
         QT_DEVICE="linux-aarch64-gnu-g++"
-        TOOLCHAIN_BIN="/usr/bin"          # gcc-aarch64-linux-gnu installé via apt
-        MKSPEC_SRC="linux-arm-gnueabi-g++" # Base pour créer le mkspec aarch64
+        MKSPEC_SRC="linux-arm-gnueabi-g++"
         MKSPEC_DST="linux-aarch64-gnu-g++"
-        LINARO_DIR=""                      # Pas de toolchain Linaro pour 64 bits
-        echo -e "${YELLOW}>>> Mode 64 bits (aarch64) sélectionné.${NC}"
+        PKG_CONFIG_ARCH_PATH="aarch64-linux-gnu"
+        echo -e "${YELLOW}  >>> Userland 64 bits (arm64)${NC}"
 
-    elif [[ "$RPI_ARCH" == "armv7l" ]] || [[ "$RPI_ARCH" == "armv6l" ]] || [[ "$RPI_DEB_ARCH" == "armhf" ]]; then
-        # ---- 32 bits ----
+    elif [[ "$RPI_DEB_ARCH" == "armhf" ]]; then
         ARCH_BITS=32
         CROSS_COMPILE_PREFIX="arm-linux-gnueabihf-"
         QT_DEVICE="linux-rasp-pi4-v3d-g++"
-        LINARO_DIR="$CROSS_DIR/tools/gcc-linaro-7.4.1-2019.02-x86_64_arm-linux-gnueabihf"
-        TOOLCHAIN_BIN="$LINARO_DIR/bin"
         MKSPEC_SRC="linux-arm-gnueabi-g++"
         MKSPEC_DST="linux-arm-gnueabihf-g++"
-        echo -e "${YELLOW}>>> Mode 32 bits (armhf) sélectionné.${NC}"
+        PKG_CONFIG_ARCH_PATH="arm-linux-gnueabihf"
+        echo -e "${YELLOW}  >>> Userland 32 bits (armhf)${NC}"
+        if [[ "$RPI_ARCH" == "aarch64" ]]; then
+            echo -e "${YELLOW}      (noyau 64 bits + userland 32 bits — RPi OS Bookworm 32 bits)${NC}"
+        fi
 
     else
-        echo -e "${YELLOW}ERREUR : Architecture non reconnue : $RPI_ARCH / $RPI_DEB_ARCH${NC}"
+        echo -e "${RED}Architecture Debian non reconnue : '$RPI_DEB_ARCH'${NC}"
+        echo -e "${RED}Valeurs attendues : 'armhf' ou 'arm64'${NC}"
         exit 1
     fi
 
-    echo -e "${YELLOW}=== Résumé architecture ===${NC}"
-    echo -e "${YELLOW}  Bits              : ${ARCH_BITS}${NC}"
-    echo -e "${YELLOW}  Cross-compile     : ${CROSS_COMPILE_PREFIX}${NC}"
-    echo -e "${YELLOW}  Qt device         : ${QT_DEVICE}${NC}"
-    echo -e "${YELLOW}  Toolchain bin     : ${TOOLCHAIN_BIN}${NC}"
+    MYSQL_INCDIR="$CROSS_DIR/sysroot/usr/include/mariadb"
+    MYSQL_LIBDIR="$CROSS_DIR/sysroot/usr/lib/$PKG_CONFIG_ARCH_PATH"
+
+    echo -e "${YELLOW}  Bits          : $ARCH_BITS${NC}"
+    echo -e "${YELLOW}  Cross-compile : $CROSS_COMPILE_PREFIX${NC}"
+    echo -e "${YELLOW}  Qt device     : $QT_DEVICE${NC}"
+    echo -e "${YELLOW}  MYSQL_INCDIR  : $MYSQL_INCDIR${NC}"
+    echo -e "${YELLOW}  MYSQL_LIBDIR  : $MYSQL_LIBDIR${NC}"
 }
 
-# =============================================
-# Vérification et gestion des versions de gcc/g++
-# (uniquement nécessaire en 32 bits avec Linaro 7.4)
-# =============================================
-check_and_set_gcc_version() {
+# ==============================================================================
+# Installation toolchain croisée via apt
+# ==============================================================================
+install_cross_toolchain() {
+    echo -e "${GREEN}=== Installation toolchain croisée ===${NC}"
     if [ "$ARCH_BITS" -eq 64 ]; then
-        echo -e "${YELLOW}=== 64 bits : vérification gcc/g++ système ignorée (Linaro non utilisé) ===${NC}"
-        return 0
-    fi
-
-    echo -e "${YELLOW}=== Vérification des versions de gcc et g++ ===${NC}"
-
-    # Sauvegarder les versions originales
-    ORIGINAL_GCC=$(ls -l /usr/bin/gcc 2>/dev/null | awk '{print $NF}' | grep -oP '\d+(\.\d+)*$' | head -1)
-    ORIGINAL_GPP=$(ls -l /usr/bin/g++ 2>/dev/null | awk '{print $NF}' | grep -oP '\d+(\.\d+)*$' | head -1)
-
-    echo -e "${YELLOW}Version originale de gcc : $ORIGINAL_GCC${NC}"
-    echo -e "${YELLOW}Version originale de g++ : $ORIGINAL_GPP${NC}"
-
-    GCC_VERSION=$(gcc --version | head -n1 | grep -oP '\d+' | head -1)
-    GPP_VERSION=$(g++ --version | head -n1 | grep -oP '\d+' | head -1)
-
-    echo -e "${YELLOW}Version majeure gcc : $GCC_VERSION${NC}"
-    echo -e "${YELLOW}Version majeure g++ : $GPP_VERSION${NC}"
-
-    if [ "$GCC_VERSION" -ge 11 ] || [ "$GPP_VERSION" -ge 11 ]; then
-        echo -e "${YELLOW}Version 11+ détectée, installation de gcc-9 et g++-9 pour compatibilité Qt 5.15...${NC}"
-        executer_locale "sudo apt update"
-        executer_locale "sudo apt install -y gcc-9 g++-9"
-        executer_locale "sudo ln -s -f /usr/bin/gcc-9 /usr/bin/gcc"
-        executer_locale "sudo ln -s -f /usr/bin/g++-9 /usr/bin/g++"
-
-        NEW_GCC_VERSION=$(gcc --version | head -n1)
-        NEW_GPP_VERSION=$(g++ --version | head -n1)
-        echo -e "${YELLOW}Nouvelles versions actives :${NC}"
-        echo -e "${YELLOW}  $NEW_GCC_VERSION${NC}"
-        echo -e "${YELLOW}  $NEW_GPP_VERSION${NC}"
+        executer_locale "sudo apt install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu"
+        echo -e "${GREEN}  $(aarch64-linux-gnu-gcc --version | head -1)${NC}"
     else
-        echo -e "${YELLOW}Les versions de gcc/g++ sont compatibles (< 11).${NC}"
+        executer_locale "sudo apt install -y \
+            gcc-arm-linux-gnueabihf \
+            g++-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf"
+        echo -e "${GREEN}  $(arm-linux-gnueabihf-gcc --version | head -1)${NC}"
     fi
 }
 
-# =============================================
-# Rétablir les versions originales de gcc/g++
-# =============================================
-restore_gcc_version() {
-    if [ "$ARCH_BITS" -eq 64 ]; then
-        return 0
+# ==============================================================================
+# Patch Qt 5.15.2 pour gcc >= 11 — version sed
+#
+# Problème : Qt 5.15.2 utilise std::numeric_limits dans plusieurs fichiers
+# sans inclure <limits>. gcc >= 11 est strict sur ce point et refuse de
+# compiler avec "numeric_limits is not a member of std".
+#
+# Solution : insérer #include <limits> avant QT_BEGIN_NAMESPACE dans chaque
+# fichier concerné, via sed.
+#
+# Fichiers connus affectés dans Qt 5.15.2 :
+#   qfloat16.h, qbytearraymatcher.h, qoffsetstringarray_p.h,
+#   qendian.h, qstring.h, qstringview.h
+# ==============================================================================
+patch_qt5_gcc11() {
+    echo -e "${GREEN}=== Patch Qt 5.15.2 pour gcc >= 11 ===${NC}"
+
+    local QT_SRC="$CROSS_DIR/qt-everywhere-src-5.15.2"
+
+    if [ ! -d "$QT_SRC" ]; then
+        echo -e "${RED}ERREUR : répertoire Qt source introuvable : $QT_SRC${NC}"
+        exit 1
     fi
 
-    echo -e "${YELLOW}=== Rétablissement des versions originales de gcc/g++ ===${NC}"
+    local FILES_TO_PATCH="
+        qtbase/src/corelib/global/qfloat16.h
+        qtbase/src/corelib/text/qbytearraymatcher.h
+        qtbase/src/corelib/tools/qoffsetstringarray_p.h
+        qtbase/src/corelib/global/qendian.h
+        qtbase/src/corelib/text/qstring.h
+        qtbase/src/corelib/text/qstringview.h
+    "
 
-    if [ -n "$ORIGINAL_GCC" ]; then
-        executer_locale "sudo ln -s -f /usr/bin/gcc-$ORIGINAL_GCC /usr/bin/gcc"
-        executer_locale "sudo ln -s -f /usr/bin/g++-$ORIGINAL_GPP /usr/bin/g++"
-        echo -e "${YELLOW}Versions rétablies : gcc-$ORIGINAL_GCC / g++-$ORIGINAL_GPP${NC}"
-    else
-        echo -e "${YELLOW}Aucune version originale à rétablir.${NC}"
-    fi
-}
+    local patched=0
+    local already=0
+    local skipped=0
 
-# =============================================
-# Téléchargement/installation de la toolchain
-# =============================================
-check_and_download_toolchain() {
-    echo -e "${GREEN}=== Préparation de la toolchain ===${NC}"
+    for rel_path in $FILES_TO_PATCH; do
+        local full_path="$QT_SRC/$rel_path"
 
-    if [ "$ARCH_BITS" -eq 64 ]; then
-        # 64 bits : utiliser le paquet apt Ubuntu
-        echo -e "${GREEN}Installation de la toolchain aarch64 via apt...${NC}"
-        executer_locale "sudo apt update"
-        executer_locale "sudo apt install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu"
-
-        # Vérification
-        if ! command -v aarch64-linux-gnu-gcc &>/dev/null; then
-            echo -e "${GREEN}ERREUR : aarch64-linux-gnu-gcc introuvable après installation.${NC}"
-            exit 1
+        if [ ! -f "$full_path" ]; then
+            echo -e "${YELLOW}  [SKIP] Non trouvé : $rel_path${NC}"
+            skipped=$((skipped + 1))
+            continue
         fi
-        echo -e "${GREEN}Toolchain aarch64 installée : $(aarch64-linux-gnu-gcc --version | head -1)${NC}"
 
-    else
-        # 32 bits : toolchain Linaro
-        LINARO_ARCHIVE="$CROSS_DIR/tools/toolchain.tar.xz"
+        if grep -q '#include <limits>' "$full_path"; then
+            echo -e "${GREEN}  [OK]   Déjà patché : $rel_path${NC}"
+            already=$((already + 1))
+            continue
+        fi
 
-        if [ -d "$LINARO_DIR" ]; then
-            echo -e "${GREEN}La toolchain Linaro est déjà présente : $LINARO_DIR${NC}"
+        if grep -q 'QT_BEGIN_NAMESPACE' "$full_path"; then
+            # Insérer #include <limits> juste avant QT_BEGIN_NAMESPACE
+            sed -i '/QT_BEGIN_NAMESPACE/i #include <limits>' "$full_path"
         else
-            echo -e "${GREEN}Téléchargement de la toolchain Linaro 7.4.1 (armhf)...${NC}"
-            executer_locale "mkdir -p $CROSS_DIR/tools"
-            executer_locale "wget $TOOLCHAIN_URL_32 -O $LINARO_ARCHIVE"
-
-            if [ -f "$LINARO_ARCHIVE" ]; then
-                echo -e "${GREEN}Décompression de la toolchain Linaro...${NC}"
-                executer_locale "cd $CROSS_DIR/tools && tar xfv $LINARO_ARCHIVE"
-
-                if [ -d "$LINARO_DIR" ]; then
-                    echo -e "${GREEN}Toolchain Linaro décompressée avec succès.${NC}"
-                    executer_locale "rm $LINARO_ARCHIVE"
-                else
-                    echo -e "${GREEN}ERREUR : La décompression a échoué (dossier attendu : $LINARO_DIR).${NC}"
-                    exit 1
-                fi
+            # Fallback : insérer après le dernier #include existant
+            local last_include
+            last_include=$(grep -n '^#include' "$full_path" | tail -1 | cut -d: -f1)
+            if [ -n "$last_include" ]; then
+                sed -i "${last_include}a #include <limits>" "$full_path"
             else
-                echo -e "${GREEN}ERREUR : Le téléchargement de la toolchain Linaro a échoué.${NC}"
-                exit 1
+                echo -e "${YELLOW}  [WARN] Impossible de patcher : $rel_path${NC}"
+                continue
             fi
         fi
-    fi
+
+        # Vérification que le patch a bien été appliqué
+        if grep -q '#include <limits>' "$full_path"; then
+            echo -e "${GREEN}  [PATCH] $rel_path${NC}"
+            patched=$((patched + 1))
+        else
+            echo -e "${RED}  [ECHEC] Patch non appliqué : $rel_path${NC}"
+        fi
+    done
+
+    echo -e "${GREEN}  Résultat : $patched patché(s), $already déjà OK, $skipped non trouvé(s)${NC}"
 }
 
-# =============================================
-# Création du mkspec Qt pour aarch64 (64 bits uniquement)
-# Qt 5.15.2 ne fournit pas de device linux-aarch64-gnu-g++ natif.
-# On crée un mkspec générique basé sur linux-arm-gnueabi-g++.
-# =============================================
+# ==============================================================================
+# Mkspec Qt pour aarch64 (Qt 5 n'en fournit pas nativement)
+# ==============================================================================
 create_aarch64_mkspec() {
-    if [ "$ARCH_BITS" -ne 64 ]; then
+    [ "$ARCH_BITS" -ne 64 ] && return 0
+    local DST="$CROSS_DIR/qt-everywhere-src-5.15.2/qtbase/mkspecs/$MKSPEC_DST"
+    if [ -d "$DST" ]; then
+        echo -e "${GREEN}Mkspec $MKSPEC_DST déjà présent.${NC}"
         return 0
     fi
-
-    local MKSPECS_DIR="$CROSS_DIR/qt-everywhere-src-5.15.2/qtbase/mkspecs"
-    local DST_DIR="$MKSPECS_DIR/$MKSPEC_DST"
-
-    if [ -d "$DST_DIR" ]; then
-        echo -e "${GREEN}Le mkspec $MKSPEC_DST existe déjà.${NC}"
-        return 0
-    fi
-
-    echo -e "${GREEN}Création du mkspec Qt pour aarch64 : $MKSPEC_DST${NC}"
-    executer_locale "cp -R $MKSPECS_DIR/linux-arm-gnueabi-g++ $DST_DIR"
-
-    # Adapter qmake.conf pour aarch64
-    cat > /tmp/qmake_aarch64.conf << 'EOF'
-#
-# qmake configuration for building with aarch64-linux-gnu-g++
-#
-
+    executer_locale "cp -R \
+        $CROSS_DIR/qt-everywhere-src-5.15.2/qtbase/mkspecs/$MKSPEC_SRC $DST"
+    cat > "$DST/qmake.conf" << 'EOF'
 MAKEFILE_GENERATOR      = UNIX
 CONFIG                 += incremental
 QMAKE_INCREMENTAL_STYLE = sublib
-
 include(../common/linux.conf)
 include(../common/gcc-base-unix.conf)
 include(../common/g++-unix.conf)
-
-# modifications to g++.conf
 QMAKE_CC                = aarch64-linux-gnu-gcc
 QMAKE_CXX               = aarch64-linux-gnu-g++
 QMAKE_LINK              = aarch64-linux-gnu-g++
 QMAKE_LINK_SHLIB        = aarch64-linux-gnu-g++
-
-# modifications to linux.conf
 QMAKE_AR                = aarch64-linux-gnu-ar cqs
 QMAKE_OBJCOPY           = aarch64-linux-gnu-objcopy
 QMAKE_NM                = aarch64-linux-gnu-nm -P
 QMAKE_STRIP             = aarch64-linux-gnu-strip
-
 load(qt_config)
 EOF
-
-    executer_locale "cp /tmp/qmake_aarch64.conf $DST_DIR/qmake.conf"
-    echo -e "${GREEN}mkspec aarch64 créé avec succès dans $DST_DIR${NC}"
+    echo -e "${GREEN}Mkspec aarch64 créé.${NC}"
 }
 
-# =============================================
-# Début du script principal
-# =============================================
+# ==============================================================================
+# Vérification MariaDB dans le sysroot
+# ==============================================================================
+verify_mysql_sysroot() {
+    echo -e "${GREEN}=== Vérification MariaDB dans le sysroot ===${NC}"
 
-echo -e "${YELLOW}========================================${NC}"
-echo -e "${YELLOW}  Cross-compilation Qt 5.15.2 pour RPi4 ${NC}"
-echo -e "${YELLOW}========================================${NC}"
-
-# =============================================
-# Génération et copie de la clé SSH
-# =============================================
-echo -e "${GREEN}=== Vérification et configuration de la clé SSH ===${NC}"
-
-if [ ! -f "$SSH_KEY_PATH" ]; then
-    echo -e "${GREEN}Génération d'une nouvelle clé SSH...${NC}"
-    executer_locale "ssh-keygen -t rsa -f $SSH_KEY_PATH -N ''"
-else
-    echo -e "${GREEN}La clé SSH existe déjà : $SSH_KEY_PATH${NC}"
-fi
-
-if ! ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" "grep -q \"\$(cat $SSH_KEY_PATH.pub)\" ~/.ssh/authorized_keys" 2>/dev/null; then
-    echo -e "${GREEN}Copie de la clé publique sur le RPi4...${NC}"
-    executer_locale "ssh-copy-id -i $SSH_KEY_PATH.pub -p $RPI_PORT $RPI_USER@$RPI_HOST"
-else
-    echo -e "${GREEN}La clé publique est déjà présente sur le RPi4.${NC}"
-fi
-
-# =============================================
-# Détection de l'architecture — DOIT être fait
-# avant toute autre étape
-# =============================================
-detect_rpi_arch
-
-# =============================================
-# Partie 1 : Configuration du RPi4
-# =============================================
-echo -e "${BLUE}=== Configuration de la RPi4 ===${NC}"
-
-# Installation de WiringPi (armhf uniquement — pas de paquet armhf sur 64 bits)
-if [ "$ARCH_BITS" -eq 32 ]; then
-    echo -e "${BLUE}=== Installation de WiringPi (32 bits) ===${NC}"
-
-    WIRINGPI_DEB_URL=$(curl -s https://api.github.com/repos/WiringPi/WiringPi/releases/latest \
-        | grep "browser_download_url.*armhf.deb" | cut -d '"' -f 4)
-
-    if [ -z "$WIRINGPI_DEB_URL" ]; then
-        echo "Impossible de récupérer l'URL du fichier .deb armhf de WiringPi."
+    if [ ! -f "$MYSQL_INCDIR/mysql.h" ]; then
+        echo -e "${RED}ERREUR : $MYSQL_INCDIR/mysql.h introuvable !${NC}"
+        echo -e "${RED}libmariadb-dev doit être installé sur le RPi AVANT le rsync.${NC}"
         exit 1
     fi
+    echo -e "${GREEN}  mysql.h : OK${NC}"
 
-    echo "URL WiringPi armhf : $WIRINGPI_DEB_URL"
-    executer_distante "
-        wget -O /tmp/wiringpi-latest.deb '$WIRINGPI_DEB_URL'
-        sudo dpkg -i /tmp/wiringpi-latest.deb
-        sudo apt-get install -f -y
-        rm /tmp/wiringpi-latest.deb
-        echo 'WiringPi installé avec succès !'
-    "
-else
-    echo -e "${BLUE}=== Installation de WiringPi (64 bits / arm64) ===${NC}"
+    MYSQL_LIB_FOUND=""
+    for libname in "libmariadb.so" "libmariadbclient.so" "libmysqlclient.so"; do
+        if [ -f "$MYSQL_LIBDIR/$libname" ]; then
+            MYSQL_LIB_FOUND="$MYSQL_LIBDIR/$libname"
+            break
+        fi
+    done
 
-    WIRINGPI_DEB_URL=$(curl -s https://api.github.com/repos/WiringPi/WiringPi/releases/latest \
-        | grep "browser_download_url.*arm64.deb" | cut -d '"' -f 4)
-
-    if [ -z "$WIRINGPI_DEB_URL" ]; then
-        echo -e "${BLUE}Pas de paquet arm64 WiringPi disponible, installation ignorée.${NC}"
-    else
-        echo "URL WiringPi arm64 : $WIRINGPI_DEB_URL"
-        executer_distante "
-            wget -O /tmp/wiringpi-latest.deb '$WIRINGPI_DEB_URL'
-            sudo dpkg -i /tmp/wiringpi-latest.deb
-            sudo apt-get install -f -y
-            rm /tmp/wiringpi-latest.deb
-            echo 'WiringPi arm64 installé avec succès !'
-        "
+    if [ -z "$MYSQL_LIB_FOUND" ]; then
+        echo -e "${YELLOW}  Recherche libmariadb dans tout le sysroot...${NC}"
+        MYSQL_LIB_FOUND=$(find "$CROSS_DIR/sysroot" \
+            -name "libmariadb*.so*" 2>/dev/null | head -1)
+        if [ -n "$MYSQL_LIB_FOUND" ]; then
+            MYSQL_LIBDIR=$(dirname "$MYSQL_LIB_FOUND")
+            echo -e "${YELLOW}  MYSQL_LIBDIR ajusté : $MYSQL_LIBDIR${NC}"
+        else
+            echo -e "${RED}ERREUR : libmariadb.so introuvable dans le sysroot.${NC}"
+            exit 1
+        fi
     fi
+
+    echo -e "${GREEN}  MYSQL_INCDIR  : $MYSQL_INCDIR${NC}"
+    echo -e "${GREEN}  MYSQL_LIBDIR  : $MYSQL_LIBDIR${NC}"
+    echo -e "${GREEN}  Bibliothèque  : $MYSQL_LIB_FOUND${NC}"
+}
+
+# ==============================================================================
+# ==============================================================================
+# DÉBUT DU SCRIPT PRINCIPAL
+# ==============================================================================
+# ==============================================================================
+
+echo -e "${YELLOW}============================================================${NC}"
+echo -e "${YELLOW}  Cross-compilation Qt 5.15.2 + QMYSQL + SQLite — RPi4     ${NC}"
+echo -e "${YELLOW}  Toolchain : gcc-arm-linux-gnueabihf (apt, pas de Linaro)  ${NC}"
+echo -e "${YELLOW}  Patch gcc >= 11 : sed direct, fiable                      ${NC}"
+echo -e "${YELLOW}============================================================${NC}"
+
+# ==============================================================================
+# SSH
+# ==============================================================================
+echo -e "${GREEN}=== Configuration SSH ===${NC}"
+if [ ! -f "$SSH_KEY_PATH" ]; then
+    executer_locale "ssh-keygen -t rsa -f $SSH_KEY_PATH -N ''"
+else
+    echo -e "${GREEN}Clé SSH existante : $SSH_KEY_PATH${NC}"
 fi
 
-# Décommenter les sources deb-src
-executer_distante "
-    if sudo grep -q '^#deb-src' /etc/apt/sources.list; then
-        sudo sed -i '/^#deb-src/s/^#//' /etc/apt/sources.list
-        echo 'Ligne deb-src décommentée.'
-    else
-        echo 'Aucune ligne deb-src commentée trouvée.'
+if ! ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" \
+    "grep -qF \"\$(cat $SSH_KEY_PATH.pub)\" ~/.ssh/authorized_keys" 2>/dev/null; then
+    executer_locale "ssh-copy-id -i $SSH_KEY_PATH.pub -p $RPI_PORT $RPI_USER@$RPI_HOST"
+else
+    echo -e "${GREEN}Clé publique déjà présente sur le RPi.${NC}"
+fi
+
+# ==============================================================================
+# Détection architecture — EN PREMIER
+# ==============================================================================
+detect_rpi_arch
+
+# ==============================================================================
+# Partie 1 : Configuration RPi4
+# ORDRE CRITIQUE : MariaDB dev AVANT rsync sysroot
+# ==============================================================================
+echo -e "${BLUE}=== Partie 1 : Configuration RPi4 ===${NC}"
+
+# --- WiringPi ---
+echo -e "${BLUE}--- WiringPi ---${NC}"
+if [ "$ARCH_BITS" -eq 32 ]; then DEB_ARCH_PKG="armhf"; else DEB_ARCH_PKG="arm64"; fi
+
+WIRINGPI_URL=$(curl -s \
+    https://api.github.com/repos/WiringPi/WiringPi/releases/latest \
+    | grep "browser_download_url.*${DEB_ARCH_PKG}.deb" \
+    | cut -d '"' -f 4)
+
+if [ -n "$WIRINGPI_URL" ]; then
+    echo -e "${BLUE}  URL : $WIRINGPI_URL${NC}"
+    executer_distante "wget -O /tmp/wiringpi.deb '$WIRINGPI_URL'"
+    # ; au lieu de && pour que apt-get -f s'exécute même si dpkg échoue
+    ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" \
+        "sudo dpkg -i /tmp/wiringpi.deb ; \
+         sudo apt-get install -f -y && \
+         rm -f /tmp/wiringpi.deb && \
+         echo '  WiringPi installé.'"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Echec installation WiringPi.${NC}"
+        exit 1
     fi
+else
+    echo -e "${YELLOW}  Aucun paquet WiringPi ${DEB_ARCH_PKG} — ignoré.${NC}"
+fi
+
+# --- deb-src ---
+executer_distante \
+    "sudo grep -q '^#deb-src' /etc/apt/sources.list && \
+     sudo sed -i '/^#deb-src/s/^#//' /etc/apt/sources.list || true"
+
+# --- Mise à jour système ---
+executer_distante "sudo apt update && sudo apt upgrade -y"
+
+# --- Dépendances Qt 5 ---
+echo -e "${BLUE}--- Dépendances Qt 5 ---${NC}"
+executer_distante "
+    sudo apt-get build-dep -y \
+        qt5-qmake libqt5gui5 libqt5webengine-data libqt5webkit5 || true
+    sudo apt install -y \
+        libudev-dev libinput-dev libts-dev \
+        libxcb-xinerama0-dev libxcb-xinerama0 gdbserver \
+        qtbase5-dev qtchooser qtbase5-dev-tools \
+        libegl1-mesa-dev libgles2-mesa-dev libgbm-dev mesa-common-dev \
+        libx11-xcb-dev libglu1-mesa-dev libxrender-dev libxi-dev \
+        libxkbcommon-dev libxkbcommon-x11-dev fonts-texgyre libts-dev \
+        libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+        gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+        libopenal-dev pulseaudio bluez-tools libbluetooth-dev
+    sudo apt install -y '^libxcb.*-dev' || true
 "
 
-# Mise à jour et dépendances communes sur le RPi
+# --- MariaDB dev — DOIT être AVANT le rsync ---
+echo -e "${BLUE}--- MariaDB dev (AVANT rsync sysroot) ---${NC}"
 executer_distante "
-    sudo apt update && sudo apt upgrade -y
-    sudo apt-get build-dep -y qt5-qmake libqt5gui5 libqt5webengine-data libqt5webkit5
-    sudo apt install -y libudev-dev libinput-dev libts-dev libxcb-xinerama0-dev libxcb-xinerama0 gdbserver
-    sudo apt install -y qtbase5-dev qtchooser qtbase5-dev-tools
-    sudo apt install -y libegl1-mesa libegl1-mesa-dev libgles2-mesa libgles2-mesa-dev libgbm-dev mesa-common-dev
-    sudo apt install -y '^libxcb.*-dev' libx11-xcb-dev libglu1-mesa-dev libxrender-dev libxi-dev libxkbcommon-dev libxkbcommon-x11-dev
-    sudo apt install -y fonts-texgyre libts-dev
-    sudo apt install -y gstreamer1.0-plugins* libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopenal-data libsndio7.0 libopenal1 libopenal-dev pulseaudio
-    sudo apt install -y bluez-tools libbluetooth-dev
-    sudo gpasswd -a $RPI_USER render
+    sudo apt install -y libmariadb-dev libmariadb-dev-compat libmariadb3
+    test -f /usr/include/mariadb/mysql.h \
+        && echo '  [OK] mysql.h présent' \
+        || echo '  [KO] mysql.h MANQUANT'
+"
+# Serveur MySQL local sur le RPi — décommentez si besoin :
+# executer_distante "
+#     sudo apt install -y mariadb-server mariadb-client
+#     sudo systemctl enable mariadb && sudo systemctl start mariadb
+# "
+
+# --- Répertoires + sudoers ---
+executer_distante "
+    sudo gpasswd -a $RPI_USER render || true
     sudo mkdir -p /usr/local/qt5.15
     sudo chown $RPI_USER:$RPI_USER /usr/local/qt5.15
-    echo '$LOCAL_USER ALL=NOPASSWD:$(which rsync)' | sudo tee --append /etc/sudoers
 "
 
-# Télécharger et exécuter SSymlinker
 executer_distante "
-    wget $SYM_LINKER_URL -O /tmp/SSymlinker
-    sudo chmod +x /tmp/SSymlinker
-    /tmp/SSymlinker -s /usr/include/arm-linux-gnueabihf/asm -d /usr/include
-    /tmp/SSymlinker -s /usr/include/arm-linux-gnueabihf/gnu -d /usr/include
-    /tmp/SSymlinker -s /usr/include/arm-linux-gnueabihf/bits -d /usr/include
-    /tmp/SSymlinker -s /usr/include/arm-linux-gnueabihf/sys -d /usr/include
-    /tmp/SSymlinker -s /usr/include/arm-linux-gnueabihf/openssl -d /usr/include
-    /tmp/SSymlinker -s /usr/lib/arm-linux-gnueabihf/crtn.o -d /usr/lib/crtn.o
-    /tmp/SSymlinker -s /usr/lib/arm-linux-gnueabihf/crt1.o -d /usr/lib/crt1.o
-    /tmp/SSymlinker -s /usr/lib/arm-linux-gnueabihf/crti.o -d /usr/lib/crti.o
+    if ! sudo grep -qF '$LOCAL_USER ALL=NOPASSWD:/usr/bin/rsync' /etc/sudoers; then
+        echo '$LOCAL_USER ALL=NOPASSWD:/usr/bin/rsync' | sudo tee --append /etc/sudoers
+        echo '  Règle sudoers rsync ajoutée.'
+    else
+        echo '  Règle sudoers rsync déjà présente.'
+    fi
+    sudo visudo -c && echo '  sudoers valide.' || { echo 'ERREUR sudoers !'; exit 1; }
 "
 
-# =============================================
-# Partie 2 : Configuration du PC Ubuntu (hôte)
-# =============================================
-echo -e "${GREEN}=== Configuration du PC Ubuntu ===${NC}"
+# --- SSymlinker ---
+echo -e "${BLUE}--- SSymlinker ---${NC}"
+executer_distante \
+    "wget '$SYM_LINKER_URL' -O /tmp/SSymlinker && sudo chmod +x /tmp/SSymlinker"
 
-executer_locale "sudo apt update"
-executer_locale "sudo apt dist-upgrade -y"
-executer_locale "sudo apt install -y build-essential cmake unzip gfortran gcc git bison python3 python-is-python3 gperf pkg-config gdb-multiarch wget curl"
-executer_locale "sudo apt-get install -y gcc g++ gperf flex texinfo gawk bison openssl pigz libncurses-dev autoconf automake tar figlet"
-executer_locale "sudo apt-get install -y '^libxcb.*-dev' libx11-xcb-dev libglu1-mesa-dev libxrender-dev libxi-dev libxkbcommon-dev libxkbcommon-x11-dev"
+for SYM_SRC in \
+    "/usr/include/$PKG_CONFIG_ARCH_PATH/asm" \
+    "/usr/include/$PKG_CONFIG_ARCH_PATH/gnu" \
+    "/usr/include/$PKG_CONFIG_ARCH_PATH/bits" \
+    "/usr/include/$PKG_CONFIG_ARCH_PATH/sys" \
+    "/usr/include/$PKG_CONFIG_ARCH_PATH/openssl"; do
+    ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" "
+        if [ -d '$SYM_SRC' ]; then
+            /tmp/SSymlinker -s '$SYM_SRC' -d /usr/include \
+                && echo '  [OK]   $SYM_SRC' \
+                || echo '  [WARN] Lien existant : $SYM_SRC'
+        else
+            echo '  [SKIP] Absent : $SYM_SRC'
+        fi
+    "
+done
 
-# Création des répertoires
-executer_locale "mkdir -p $CROSS_DIR/build $CROSS_DIR/tools $CROSS_DIR/sysroot/usr $CROSS_DIR/sysroot/opt"
+for SYM_SRC in \
+    "/usr/lib/$PKG_CONFIG_ARCH_PATH/crtn.o" \
+    "/usr/lib/$PKG_CONFIG_ARCH_PATH/crt1.o" \
+    "/usr/lib/$PKG_CONFIG_ARCH_PATH/crti.o"; do
+    SYM_DST="/usr/lib/$(basename $SYM_SRC)"
+    ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" "
+        if [ -f '$SYM_SRC' ]; then
+            /tmp/SSymlinker -s '$SYM_SRC' -d '$SYM_DST' \
+                && echo '  [OK]   $SYM_SRC' \
+                || echo '  [WARN] Lien existant : $SYM_SRC'
+        else
+            echo '  [SKIP] Absent : $SYM_SRC'
+        fi
+    "
+done
+
+# ==============================================================================
+# Partie 2 : Configuration PC Ubuntu hôte
+# ==============================================================================
+echo -e "${GREEN}=== Partie 2 : Configuration PC Ubuntu ===${NC}"
+
+executer_locale "sudo apt update && sudo apt dist-upgrade -y"
+executer_locale "sudo apt install -y \
+    build-essential cmake unzip gfortran git bison \
+    python3 python-is-python3 gperf pkg-config gdb-multiarch wget curl \
+    flex texinfo gawk openssl pigz libncurses-dev autoconf automake tar \
+    libxkbcommon-dev libxkbcommon-x11-dev \
+    libx11-xcb-dev libglu1-mesa-dev libxrender-dev libxi-dev"
+executer_locale "sudo apt-get install -y '^libxcb.*-dev'"
+
+executer_locale "mkdir -p \
+    $CROSS_DIR/build \
+    $CROSS_DIR/sysroot/usr \
+    $CROSS_DIR/sysroot/opt"
 executer_locale "sudo chown -R $LOCAL_USER:$LOCAL_GROUP $CROSS_DIR"
 
-# Installation/téléchargement de la toolchain selon l'architecture
-check_and_download_toolchain
+install_cross_toolchain
 
-# Gestion de la version gcc hôte (uniquement 32 bits)
-check_and_set_gcc_version
+# ==============================================================================
+# Partie 3 : Synchronisation sysroot depuis le RPi
+# APRÈS installation MariaDB (Partie 1) → headers inclus dans le rsync
+# ==============================================================================
+echo -e "${GREEN}=== Partie 3 : Synchronisation sysroot ===${NC}"
+echo -e "${GREEN}    (headers MariaDB inclus dans ce rsync)${NC}"
 
-# =============================================
-# Synchronisation du sysroot depuis le RPi4
-# =============================================
-echo -e "${GREEN}=== Synchronisation du sysroot depuis le RPi4 ===${NC}"
-
-executer_locale "rsync -avz --rsync-path='sudo rsync' --delete $RPI_USER@$RPI_HOST:/lib $CROSS_DIR/sysroot"
-executer_locale "rsync -avz --rsync-path='sudo rsync' --delete $RPI_USER@$RPI_HOST:/usr/include $CROSS_DIR/sysroot/usr"
-executer_locale "rsync -avz --rsync-path='sudo rsync' --delete $RPI_USER@$RPI_HOST:/usr/lib $CROSS_DIR/sysroot/usr"
+executer_locale "rsync -avz --rsync-path='sudo rsync' --delete \
+    $RPI_USER@$RPI_HOST:/lib $CROSS_DIR/sysroot"
+executer_locale "rsync -avz --rsync-path='sudo rsync' --delete \
+    $RPI_USER@$RPI_HOST:/usr/include $CROSS_DIR/sysroot/usr"
+executer_locale "rsync -avz --rsync-path='sudo rsync' --delete \
+    $RPI_USER@$RPI_HOST:/usr/lib $CROSS_DIR/sysroot/usr"
 
 if ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" "[ -d /opt/vc ]"; then
-    echo -e "${GREEN}Le dossier /opt/vc existe sur le RPi4, copie en cours...${NC}"
-    executer_locale "rsync -avz --rsync-path='sudo rsync' --delete $RPI_USER@$RPI_HOST:/opt/vc $CROSS_DIR/sysroot/opt/" || {
-        echo -e "${GREEN}rsync a échoué pour /opt/vc, tentative via scp...${NC}"
-        executer_locale "scp -r $RPI_USER@$RPI_HOST:/opt/vc $CROSS_DIR/sysroot/opt/"
-    }
+    executer_locale "rsync -avz --rsync-path='sudo rsync' --delete \
+        $RPI_USER@$RPI_HOST:/opt/vc $CROSS_DIR/sysroot/opt/" || \
+        executer_locale "scp -r \
+            $RPI_USER@$RPI_HOST:/opt/vc $CROSS_DIR/sysroot/opt/"
 else
-    echo -e "${GREEN}Le dossier /opt/vc n'existe pas sur le RPi4, création d'un dossier vide.${NC}"
+    echo -e "${GREEN}/opt/vc absent (normal sur Bookworm).${NC}"
     executer_locale "mkdir -p $CROSS_DIR/sysroot/opt/vc"
 fi
 
-# Correction des liens symboliques relatifs
-executer_locale "cd $CROSS_DIR && wget $RELATIVE_LINKS_SCRIPT_URL -O relative_links.py"
-executer_locale "cd $CROSS_DIR && chmod +x relative_links.py"
-executer_locale "cd $CROSS_DIR && ./relative_links.py sysroot"
+executer_locale "wget '$RELATIVE_LINKS_SCRIPT_URL' -O $CROSS_DIR/relative_links.py"
+executer_locale "chmod +x $CROSS_DIR/relative_links.py"
+executer_locale "$CROSS_DIR/relative_links.py $CROSS_DIR/sysroot"
 
-# =============================================
-# Partie 3 : Compilation croisée de Qt 5.15.2
-# =============================================
-echo -e "${GREEN}=== Compilation croisée de Qt 5.15.2 (${ARCH_BITS} bits) ===${NC}"
+verify_mysql_sysroot
 
-# Télécharger les sources Qt si pas déjà présentes
+# ==============================================================================
+# Partie 4 : Sources Qt 5.15.2 + PATCH gcc >= 11
+# ==============================================================================
+echo -e "${GREEN}=== Partie 4 : Sources Qt 5.15.2 ===${NC}"
+
 if [ ! -d "$CROSS_DIR/qt-everywhere-src-5.15.2" ]; then
-    executer_locale "cd $CROSS_DIR && wget $QT_SRC_URL -O qt-src.tar.xz"
-    executer_locale "cd $CROSS_DIR && tar xfv qt-src.tar.xz"
-    executer_locale "rm $CROSS_DIR/qt-src.tar.xz"
+    echo -e "${GREEN}Téléchargement sources Qt 5.15.2 (~600 Mo)...${NC}"
+    executer_locale "wget '$QT_SRC_URL' -O $CROSS_DIR/qt-src.tar.xz"
+    executer_locale "cd $CROSS_DIR && tar xfv qt-src.tar.xz && rm qt-src.tar.xz"
 else
-    echo -e "${GREEN}Les sources Qt 5.15.2 sont déjà présentes.${NC}"
+    echo -e "${GREEN}Sources Qt 5.15.2 déjà présentes.${NC}"
 fi
 
-# Création du mkspec adapté selon l'architecture
+# Patch COMPLET gcc >= 11 — sed direct, sans Python, sans heredoc
+patch_qt5_gcc11
+
+# Mkspec selon architecture
 if [ "$ARCH_BITS" -eq 32 ]; then
-    # 32 bits : copier linux-arm-gnueabi-g++ → linux-arm-gnueabihf-g++
-    if [ ! -d "$CROSS_DIR/qt-everywhere-src-5.15.2/qtbase/mkspecs/$MKSPEC_DST" ]; then
-        executer_locale "cp -R $CROSS_DIR/qt-everywhere-src-5.15.2/qtbase/mkspecs/$MKSPEC_SRC \
-            $CROSS_DIR/qt-everywhere-src-5.15.2/qtbase/mkspecs/$MKSPEC_DST"
-        executer_locale "sed -i -e 's/arm-linux-gnueabi-/arm-linux-gnueabihf-/g' \
-            $CROSS_DIR/qt-everywhere-src-5.15.2/qtbase/mkspecs/$MKSPEC_DST/qmake.conf"
+    MKSPEC_DIR="$CROSS_DIR/qt-everywhere-src-5.15.2/qtbase/mkspecs"
+    if [ ! -d "$MKSPEC_DIR/$MKSPEC_DST" ]; then
+        executer_locale "cp -R $MKSPEC_DIR/$MKSPEC_SRC $MKSPEC_DIR/$MKSPEC_DST"
+        executer_locale "sed -i \
+            's/arm-linux-gnueabi-/arm-linux-gnueabihf-/g' \
+            $MKSPEC_DIR/$MKSPEC_DST/qmake.conf"
+        echo -e "${GREEN}Mkspec armhf créé.${NC}"
     else
-        echo -e "${GREEN}Le mkspec $MKSPEC_DST existe déjà.${NC}"
+        echo -e "${GREEN}Mkspec armhf déjà présent.${NC}"
     fi
 else
-    # 64 bits : créer un mkspec aarch64 personnalisé
     create_aarch64_mkspec
 fi
 
-# Nettoyage du répertoire de build
+# ==============================================================================
+# Partie 5 : Compilation Qt 5.15.2 qtbase
+# ==============================================================================
+echo -e "${GREEN}=== Partie 5 : Compilation Qt 5.15.2 qtbase ===${NC}"
+echo -e "${GREEN}    SQL      : -sql-sqlite -sql-mysql${NC}"
+echo -e "${GREEN}    Device   : $QT_DEVICE${NC}"
+echo -e "${GREEN}    Toolchain: $TOOLCHAIN_BIN/$CROSS_COMPILE_PREFIX (${ARCH_BITS} bits)${NC}"
+
 executer_locale "rm -rf $CROSS_DIR/build && mkdir -p $CROSS_DIR/build"
 
-# Configuration Qt — options communes
-QT_CONFIGURE_COMMON="
-    -release -opengl es2 -eglfs -no-feature-eglfs_brcm \
-    -bundled-xcb-xinput \
-    -device $QT_DEVICE \
-    -device-option CROSS_COMPILE=$TOOLCHAIN_BIN/$CROSS_COMPILE_PREFIX \
-    -sysroot $CROSS_DIR/sysroot \
-    -prefix /usr/local/qt5.15 \
-    -extprefix $CROSS_DIR/qt5.15 \
-    -opensource -confirm-license \
-    -skip qtscript -skip qtwayland -skip qtwebengine \
-    -nomake tests -make libs \
-    -pkg-config -no-use-gold-linker -v -recheck
+executer_locale "
+    cd $CROSS_DIR/build && \
+    ../qt-everywhere-src-5.15.2/configure \
+        -release \
+        -opengl es2 \
+        -eglfs \
+        -no-feature-eglfs_brcm \
+        -bundled-xcb-xinput \
+        -device $QT_DEVICE \
+        -device-option CROSS_COMPILE=$TOOLCHAIN_BIN/$CROSS_COMPILE_PREFIX \
+        -sysroot $CROSS_DIR/sysroot \
+        -prefix /usr/local/qt5.15 \
+        -extprefix $CROSS_DIR/qt5.15 \
+        -opensource -confirm-license \
+        -skip qtscript \
+        -skip qtwayland \
+        -skip qtwebengine \
+        -nomake tests \
+        -make libs \
+        -pkg-config \
+        -no-use-gold-linker \
+        -sql-sqlite \
+        -sql-mysql \
+        MYSQL_INCDIR=$MYSQL_INCDIR \
+        MYSQL_LIBDIR=$MYSQL_LIBDIR \
+        -v -recheck
 "
 
-echo -e "${GREEN}Configuration Qt pour ${ARCH_BITS} bits (device: $QT_DEVICE)...${NC}"
-executer_locale "cd $CROSS_DIR/build && ../qt-everywhere-src-5.15.2/configure $QT_CONFIGURE_COMMON"
+# Vérification MySQL dans config.summary
+echo -e "${YELLOW}=== Vérification détection MySQL ===${NC}"
+if [ -f "$CROSS_DIR/build/config.summary" ]; then
+    if grep -qi "mysql\|sqlite" "$CROSS_DIR/build/config.summary"; then
+        echo -e "${GREEN}Lignes SQL :${NC}"
+        grep -i "mysql\|sqlite" "$CROSS_DIR/build/config.summary"
+    else
+        echo -e "${RED}MySQL absent de config.summary — QMYSQL ne sera pas compilé !${NC}"
+    fi
+fi
 
-echo -e "${GREEN}Compilation Qt (make -j$(nproc))...${NC}"
+echo -e "${GREEN}=== make -j$(nproc) ===${NC}"
 executer_locale "cd $CROSS_DIR/build && make -j$(nproc)"
 
-echo -e "${GREEN}Installation Qt dans $CROSS_DIR/qt5.15...${NC}"
+echo -e "${GREEN}=== make install ===${NC}"
 executer_locale "cd $CROSS_DIR/build && make install"
 
-# =============================================
-# Partie 4 : Compilation des modules Qt supplémentaires
-# =============================================
-echo -e "${YELLOW}=== Compilation des modules Qt supplémentaires ===${NC}"
+# Vérification plugins
+echo -e "${GREEN}=== Plugins SQL produits ===${NC}"
+PLUGIN_DIR="$CROSS_DIR/qt5.15/plugins/sqldrivers"
+if [ -d "$PLUGIN_DIR" ]; then
+    ls -la "$PLUGIN_DIR/"
+    [ -f "$PLUGIN_DIR/libqsqlmysql.so" ] \
+        && echo -e "${GREEN}[OK] libqsqlmysql.so${NC}" \
+        || echo -e "${RED}[KO] libqsqlmysql.so ABSENT${NC}"
+    [ -f "$PLUGIN_DIR/libqsqlite.so" ] \
+        && echo -e "${GREEN}[OK] libqsqlite.so${NC}" \
+        || echo -e "${RED}[KO] libqsqlite.so ABSENT${NC}"
+else
+    echo -e "${RED}Dossier sqldrivers absent.${NC}"
+fi
+
+# ==============================================================================
+# Partie 6 : Modules Qt supplémentaires
+# ==============================================================================
+echo -e "${YELLOW}=== Partie 6 : Modules Qt supplémentaires ===${NC}"
 
 for module in "${MODULES_TO_BUILD[@]}"; do
     MODULE_ENTRY="${QT_MODULES[$module]}"
-    if [ -z "$MODULE_ENTRY" ]; then
-        echo -e "${YELLOW}AVERTISSEMENT : Module '$module' non trouvé dans QT_MODULES, ignoré.${NC}"
-        continue
-    fi
-
-    # Extraire URL et version
-    url="${MODULE_ENTRY%%:*}"          # tout avant le premier ':'
-    # La version est la partie après le dernier ':'  (git: compte aussi)
+    url="${MODULE_ENTRY%%:*}"
     version="${MODULE_ENTRY##*:}"
-
-    echo -e "${YELLOW}--- Module : $module (v$version) ---${NC}"
-
+    echo -e "${YELLOW}--- $module (v$version) ---${NC}"
     if [ ! -d "$CROSS_DIR/$module" ]; then
-        executer_locale "cd $CROSS_DIR && git clone $url -b v$version --depth 1 $module"
+        executer_locale \
+            "cd $CROSS_DIR && git clone $url -b v$version --depth 1 $module"
     else
-        echo -e "${YELLOW}Le module $module est déjà cloné.${NC}"
+        echo -e "${YELLOW}    Sources déjà présentes.${NC}"
     fi
-
     executer_locale "
         cd $CROSS_DIR/$module && \
         $CROSS_DIR/qt5.15/bin/qmake && \
         make -j$(nproc) && \
         make install
     "
+    echo -e "${GREEN}    $module : OK${NC}"
 done
 
-# =============================================
-# Partie 5 : Déploiement sur le RPi4
-# =============================================
-echo -e "${GREEN}=== Déploiement de Qt 5.15 sur le RPi4 ===${NC}"
-executer_locale "rsync -avz --rsync-path='sudo rsync' $CROSS_DIR/qt5.15 $RPI_USER@$RPI_HOST:/usr/local"
+# ==============================================================================
+# Partie 7 : Déploiement sur le RPi
+# ==============================================================================
+echo -e "${GREEN}=== Partie 7 : Déploiement sur le RPi ===${NC}"
+
+executer_locale "rsync -avz --rsync-path='sudo rsync' \
+    $CROSS_DIR/qt5.15/ $RPI_USER@$RPI_HOST:/usr/local/qt5.15"
 
 executer_distante "
     echo '/usr/local/qt5.15/lib' | sudo tee /etc/ld.so.conf.d/qt5pi.conf
     sudo ldconfig
+    echo ''
+    echo '--- Plugins SQL déployés ---'
+    ls -la /usr/local/qt5.15/plugins/sqldrivers/ 2>/dev/null \
+        || echo 'Dossier sqldrivers non trouvé'
+    echo ''
+    echo '--- Runtime libmariadb ---'
+    ldconfig -p | grep mariadb || echo 'libmariadb non trouvée dans ldconfig'
 "
 
-# Rétablir gcc hôte si modifié (32 bits uniquement)
-restore_gcc_version
-
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  Installation Qt 5.15.2 terminée !     ${NC}"
-echo -e "${GREEN}  Architecture cible : ${ARCH_BITS} bits  ${NC}"
-echo -e "${GREEN}  Cross-compile prefix : ${CROSS_COMPILE_PREFIX}  ${NC}"
-echo -e "${GREEN}========================================${NC}"
+# ==============================================================================
+# Résumé final
+# ==============================================================================
+echo ""
+echo -e "${GREEN}============================================================${NC}"
+echo -e "${GREEN}   Qt 5.15.2 + QMYSQL + SQLite installés avec succès !     ${NC}"
+echo -e "${GREEN}============================================================${NC}"
+echo -e "${GREEN}  Architecture  : ${ARCH_BITS} bits (${PKG_CONFIG_ARCH_PATH})  ${NC}"
+echo -e "${GREEN}  Toolchain     : ${CROSS_COMPILE_PREFIX}gcc (apt)             ${NC}"
+echo -e "${GREEN}  Qt staging PC : $CROSS_DIR/qt5.15                           ${NC}"
+echo -e "${GREEN}  Qt sur RPi    : /usr/local/qt5.15                           ${NC}"
+echo -e "${GREEN}  Plugins SQL   : /usr/local/qt5.15/plugins/sqldrivers/       ${NC}"
+echo ""
+echo -e "${YELLOW}  Dans votre .pro :                                         ${NC}"
+echo -e "${YELLOW}    QT += sql                                               ${NC}"
+echo -e "${YELLOW}  Vérifier les drivers au runtime :                        ${NC}"
+echo -e "${YELLOW}    qDebug() << QSqlDatabase::drivers();                   ${NC}"
+echo -e "${YELLOW}    // Attendu : (\"QSQLITE\", \"QMYSQL\")                ${NC}"
+echo -e "${GREEN}============================================================${NC}"
