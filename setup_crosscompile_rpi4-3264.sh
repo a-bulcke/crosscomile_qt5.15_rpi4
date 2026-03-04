@@ -46,15 +46,15 @@ MYSQL_LIBDIR=""
 # Modules Qt à compiler après qtbase
 # ==============================================================================
 declare -A QT_MODULES=(
-    ["qtdeclarative"]="git://code.qt.io/qt/qtdeclarative.git:5.15.2"
-    ["qtquickcontrols"]="git://code.qt.io/qt/qtquickcontrols.git:5.15.2"
-    ["qtquickcontrols2"]="git://code.qt.io/qt/qtquickcontrols2.git:5.15.2"
-    ["qtvirtualkeyboard"]="git://code.qt.io/qt/qtvirtualkeyboard.git:5.15.2"
-    ["qtwebsockets"]="git://code.qt.io/qt/qtwebsockets.git:5.15.2"
-    ["qtcharts"]="git://code.qt.io/qt/qtcharts.git:5.15.2"
-    ["qtconnectivity"]="git://code.qt.io/qt/qtconnectivity.git:5.15.2"
-    ["qtmqtt"]="git://code.qt.io/qt/qtmqtt.git:5.15.2"
-    ["qtserialport"]="git://code.qt.io/qt/qtserialport.git:5.15.2"
+    ["qtdeclarative"]="https://code.qt.io/qt/qtdeclarative.git|5.15.2"
+    ["qtquickcontrols"]="https://code.qt.io/qt/qtquickcontrols.git|5.15.2"
+    ["qtquickcontrols2"]="https://code.qt.io/qt/qtquickcontrols2.git|5.15.2"
+    ["qtvirtualkeyboard"]="https://code.qt.io/qt/qtvirtualkeyboard.git|5.15.2"
+    ["qtwebsockets"]="https://code.qt.io/qt/qtwebsockets.git|5.15.2"
+    ["qtcharts"]="https://code.qt.io/qt/qtcharts.git|5.15.2"
+    ["qtconnectivity"]="https://code.qt.io/qt/qtconnectivity.git|5.15.2"
+    ["qtmqtt"]="https://code.qt.io/qt/qtmqtt.git|5.15.2"
+    ["qtserialport"]="https://code.qt.io/qt/qtserialport.git|5.15.2"
 )
 
 MODULES_TO_BUILD=(
@@ -636,8 +636,8 @@ echo -e "${YELLOW}=== Partie 6 : Modules Qt supplémentaires ===${NC}"
 
 for module in "${MODULES_TO_BUILD[@]}"; do
     MODULE_ENTRY="${QT_MODULES[$module]}"
-    url="${MODULE_ENTRY%%:*}"
-    version="${MODULE_ENTRY##*:}"
+    url="${MODULE_ENTRY%%|*}"       # tout avant le premier |
+    version="${MODULE_ENTRY##*|}"   # tout après le dernier |
     echo -e "${YELLOW}--- $module (v$version) ---${NC}"
     if [ ! -d "$CROSS_DIR/$module" ]; then
         executer_locale \
