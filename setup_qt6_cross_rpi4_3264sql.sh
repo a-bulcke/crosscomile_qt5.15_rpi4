@@ -16,15 +16,6 @@
 #   2. BUILD TARGET : tous les modules cross-compilés pour ARM
 #                     ce qui sera déployé sur le RPi
 #
-# Corrections v3 :
-#   - toolchain.cmake : syntaxe PKG_CONFIG_* corrigée (plus de ENV{})
-#   - ninja-build ajouté aux dépendances PC Ubuntu
-#   - Détection architecture via dpkg (priorité sur uname)
-#   - sudoers /usr/bin/rsync en dur, anti-doublon
-#   - WiringPi dpkg non bloquant + apt-get -f
-#   - SSymlinker : vérification existence avant lien
-#   - MariaDB dev AVANT rsync sysroot
-#   - URLs https:// + séparateur | pour les modules
 # ==============================================================================
 
 GREEN='\033[0;32m'
