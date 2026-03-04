@@ -12,20 +12,19 @@
 #
 # Architecture Qt 6 — deux builds obligatoires :
 #   1. BUILD HOST   : qtbase + qtshadertools compilés pour x86_64
-#                     → fournit les outils de build (moc, rcc, qmake, etc.)
+#                     fournit moc, rcc, qmake, qt-configure-module
 #   2. BUILD TARGET : tous les modules cross-compilés pour ARM
-#                     → ce qui sera déployé sur le RPi
+#                     ce qui sera déployé sur le RPi
 #
-# Détection architecture : dpkg --print-architecture en priorité
-#   RPi OS Bookworm 32 bits : uname=aarch64, dpkg=armhf → mode 32 bits
-#
-# Corrections issues de l'expérience Qt 5 :
-#   - sudoers : /usr/bin/rsync en dur, anti-doublon
-#   - WiringPi : dpkg non bloquant + apt-get -f
-#   - SSymlinker : vérification existence avant création lien
-#   - MariaDB dev installé AVANT le rsync du sysroot
-#   - URLs modules : https:// (git:// désactivé sur code.qt.io)
-#   - Séparateur | dans les URLs (évite conflit avec : dans https://)
+# Corrections v3 :
+#   - toolchain.cmake : syntaxe PKG_CONFIG_* corrigée (plus de ENV{})
+#   - ninja-build ajouté aux dépendances PC Ubuntu
+#   - Détection architecture via dpkg (priorité sur uname)
+#   - sudoers /usr/bin/rsync en dur, anti-doublon
+#   - WiringPi dpkg non bloquant + apt-get -f
+#   - SSymlinker : vérification existence avant lien
+#   - MariaDB dev AVANT rsync sysroot
+#   - URLs https:// + séparateur | pour les modules
 # ==============================================================================
 
 GREEN='\033[0;32m'
@@ -49,14 +48,12 @@ QT_VERSION_SHORT="6.10"
 CROSS_DIR="$HOME/cross_rpi4_qt6"
 QT_SRC_DIR="$CROSS_DIR/src"
 
-# Build host (x86_64) — outils de build uniquement
 QT_HOST_BUILD="$CROSS_DIR/host-build"
 QT_HOST_INSTALL="$CROSS_DIR/host"
 
-# Build target (ARM) — ce qui va sur le RPi
 QT_TARGET_BUILD="$CROSS_DIR/target-build"
-QT_TARGET_STAGING="$CROSS_DIR/target"   # installation locale (staging)
-QT_TARGET_PREFIX="/usr/local/qt6"       # chemin final sur le RPi
+QT_TARGET_STAGING="$CROSS_DIR/target"
+QT_TARGET_PREFIX="/usr/local/qt6"
 
 SYSROOT="$CROSS_DIR/sysroot"
 TOOLCHAIN_FILE="$CROSS_DIR/toolchain.cmake"
@@ -72,12 +69,12 @@ CROSS_COMPILE_PREFIX=""
 CMAKE_SYSTEM_PROCESSOR=""
 PKG_CONFIG_ARCH_PATH=""
 QT_DEVICE_MK=""
+CMAKE_MARCH=""
 MYSQL_INCDIR=""
 MYSQL_LIBDIR=""
 
 # ==============================================================================
-# Modules Qt 6 à compiler pour le TARGET (ARM)
-# Séparateur | pour éviter conflit avec : dans https://
+# Modules Qt 6 — séparateur | pour éviter conflit avec : dans https://
 # Ordre IMPORTANT : qtshadertools avant qtdeclarative
 # ==============================================================================
 declare -A QT_MODULES=(
@@ -90,10 +87,9 @@ declare -A QT_MODULES=(
     ["qtmultimedia"]="https://code.qt.io/qt/qtmultimedia.git|${QT_VERSION}"
     ["qtserialport"]="https://code.qt.io/qt/qtserialport.git|${QT_VERSION}"
     ["qtimageformats"]="https://code.qt.io/qt/qtimageformats.git|${QT_VERSION}"
-    ["qtmqtt"]="https://code.qt.io/qt/qtmqtt.git|${QT_VERSION_SHORT}"
+    ["qtmqtt"]="https://code.qt.io/qt/qtmqtt.git|${QT_VERSION}"
 )
 
-# Ordre de compilation : qtshadertools DOIT précéder qtdeclarative
 MODULES_TO_BUILD=(
     "qtshadertools"
     "qtdeclarative"
@@ -131,6 +127,7 @@ executer_distante() {
 # ==============================================================================
 # Détection architecture du RPi
 # PRIORITÉ à dpkg --print-architecture (userland réel)
+# RPi OS Bookworm 32 bits : uname=aarch64 mais dpkg=armhf
 # ==============================================================================
 detect_rpi_arch() {
     echo -e "${YELLOW}=== Détection architecture RPi ===${NC}"
@@ -166,7 +163,6 @@ detect_rpi_arch() {
         if [[ "$RPI_ARCH" == "aarch64" ]]; then
             echo -e "${YELLOW}      (noyau 64 bits + userland 32 bits — RPi OS Bookworm 32 bits)${NC}"
         fi
-
     else
         echo -e "${RED}Architecture non reconnue : '$RPI_DEB_ARCH'${NC}"
         exit 1
@@ -177,14 +173,14 @@ detect_rpi_arch() {
 
     echo -e "${YELLOW}  Bits            : $ARCH_BITS${NC}"
     echo -e "${YELLOW}  Cross-compile   : $CROSS_COMPILE_PREFIX${NC}"
-    echo -e "${YELLOW}  Qt device mkspec: $QT_DEVICE_MK${NC}"
+    echo -e "${YELLOW}  Qt device       : $QT_DEVICE_MK${NC}"
+    echo -e "${YELLOW}  CMAKE_MARCH     : $CMAKE_MARCH${NC}"
     echo -e "${YELLOW}  MYSQL_INCDIR    : $MYSQL_INCDIR${NC}"
     echo -e "${YELLOW}  MYSQL_LIBDIR    : $MYSQL_LIBDIR${NC}"
 }
 
 # ==============================================================================
 # Installation toolchain croisée via apt
-# Qt 6 nécessite gcc >= 11 — Ubuntu 22.04 fournit gcc-12 : parfait
 # ==============================================================================
 install_cross_toolchain() {
     echo -e "${GREEN}=== Installation toolchain croisée ===${NC}"
@@ -204,8 +200,13 @@ install_cross_toolchain() {
 }
 
 # ==============================================================================
-# Génération du fichier toolchain.cmake
-# Utilisé par CMake pour cross-compiler Qt target
+# Génération toolchain.cmake — version corrigée
+#
+# Corrections v3 :
+#   - set(ENV{PKG_CONFIG_*}) → set(PKG_CONFIG_*) : syntaxe CMake valide
+#   - ${ENV{VAR}} invalide → variables CMake directes
+#   - PKG_CONFIG_LIBDIR et PKG_CONFIG_PATH définis comme variables CMake
+#     (lus directement par le module FindPkgConfig de CMake)
 # ==============================================================================
 generate_toolchain_cmake() {
     echo -e "${GREEN}=== Génération toolchain.cmake ===${NC}"
@@ -218,6 +219,8 @@ generate_toolchain_cmake() {
         CXX_CROSS="/usr/bin/arm-linux-gnueabihf-g++"
     fi
 
+    # Le heredoc utilise EOF sans quotes → les variables bash sont interpolées
+    # Les variables CMake (\${...}) sont protégées par le backslash
     cat > "$TOOLCHAIN_FILE" << EOF
 cmake_minimum_required(VERSION 3.18)
 include_guard(GLOBAL)
@@ -225,7 +228,7 @@ include_guard(GLOBAL)
 # ==============================================================
 # Toolchain Qt 6 cross-compilation → Raspberry Pi 4
 # Architecture : ${ARCH_BITS} bits (${PKG_CONFIG_ARCH_PATH})
-# Généré automatiquement par cross_compile_qt6_rpi4_mysql.sh
+# Généré par cross_compile_qt6_rpi4_mysql.sh
 # ==============================================================
 
 set(CMAKE_SYSTEM_NAME Linux)
@@ -237,22 +240,29 @@ set(CMAKE_SYSROOT \${TARGET_SYSROOT})
 set(CMAKE_C_COMPILER   ${CC_CROSS})
 set(CMAKE_CXX_COMPILER ${CXX_CROSS})
 
-# Flags de compilation pour Cortex-A72 (RPi4)
+# Flags Cortex-A72 (RPi4)
 set(CMAKE_C_FLAGS_INIT   "${CMAKE_MARCH}")
 set(CMAKE_CXX_FLAGS_INIT "${CMAKE_MARCH}")
 
 set(QT_COMPILER_FLAGS         "${CMAKE_MARCH}")
 set(QT_COMPILER_FLAGS_RELEASE "-O2 -pipe")
-set(QT_LINKER_FLAGS           "-Wl,-O1 -Wl,--hash-style=gnu -Wl,--as-needed")
+# --allow-shlib-undefined : obligatoire en cross-compilation
+# libexpat (et d'autres .so Bookworm) référencent arc4random_buf@GLIBC_2.36
+# Le linker croisé lève une erreur, mais le RPi réel a glibc 2.36 et résout
+# normalement. _INIT = appliqué AVANT toute logique cmake projet.
+set(QT_LINKER_FLAGS                    "-Wl,-O1 -Wl,--hash-style=gnu -Wl,--as-needed -Wl,--allow-shlib-undefined")
+set(CMAKE_EXE_LINKER_FLAGS_INIT        "-Wl,--allow-shlib-undefined")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT     "-Wl,--allow-shlib-undefined")
+set(CMAKE_MODULE_LINKER_FLAGS_INIT     "-Wl,--allow-shlib-undefined")
 
-# pkg-config : pointer vers le sysroot ARM
-set(ENV{PKG_CONFIG_PATH}
-    "${SYSROOT}/usr/lib/${PKG_CONFIG_ARCH_PATH}/pkgconfig:\${ENV{PKG_CONFIG_PATH}}")
-set(ENV{PKG_CONFIG_LIBDIR}
-    "/usr/lib/pkgconfig:/usr/share/pkgconfig:${SYSROOT}/usr/lib/${PKG_CONFIG_ARCH_PATH}/pkgconfig:${SYSROOT}/usr/lib/pkgconfig")
-set(ENV{PKG_CONFIG_SYSROOT_DIR} "\${CMAKE_SYSROOT}")
+# pkg-config — variables CMake directes, lues par FindPkgConfig
+set(PKG_CONFIG_SYSROOT_DIR ${SYSROOT})
+set(PKG_CONFIG_LIBDIR
+    ${SYSROOT}/usr/lib/${PKG_CONFIG_ARCH_PATH}/pkgconfig:${SYSROOT}/usr/lib/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig)
+set(PKG_CONFIG_PATH
+    ${SYSROOT}/usr/lib/${PKG_CONFIG_ARCH_PATH}/pkgconfig:${SYSROOT}/usr/lib/pkgconfig)
 
-# Recherche : programmes sur le HOST, libs/includes dans le sysroot TARGET
+# Recherche : programmes sur le HOST, libs/includes dans le sysroot
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
@@ -260,9 +270,18 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 set(CMAKE_FIND_ROOT_PATH "\${CMAKE_SYSROOT}")
 EOF
 
-    echo -e "${GREEN}  toolchain.cmake généré : $TOOLCHAIN_FILE${NC}"
-    echo -e "${GREEN}  Sysroot    : $SYSROOT${NC}"
-    echo -e "${GREEN}  Compilateur: $CXX_CROSS${NC}"
+    echo -e "${GREEN}  toolchain.cmake : $TOOLCHAIN_FILE${NC}"
+    echo -e "${GREEN}  Sysroot         : $SYSROOT${NC}"
+    echo -e "${GREEN}  Compilateur C++ : $CXX_CROSS${NC}"
+
+    # Vérification syntaxe : aucun ENV{ invalide dans le CODE
+    # (on ignore les lignes de commentaires CMake qui commencent par #)
+    if grep -n 'ENV{' "$TOOLCHAIN_FILE" | grep -qv ':[[:space:]]*#'; then
+        echo -e "${RED}ERREUR : syntaxe ENV{ invalide dans toolchain.cmake !${NC}"
+        grep -n 'ENV{' "$TOOLCHAIN_FILE" | grep -v ':[[:space:]]*#'
+        exit 1
+    fi
+    echo -e "${GREEN}  Vérification syntaxe : OK${NC}"
 }
 
 # ==============================================================================
@@ -322,12 +341,9 @@ download_qt_sources() {
         echo -e "${GREEN}  qtbase déjà présent.${NC}"
     fi
 
-    # Modules superrepo
+    # Modules superrepo (tarballs officiels)
     for module in "${MODULES_TO_BUILD[@]}"; do
-        # qtmqtt a un tag différent (version_short uniquement)
-        if [ "$module" == "qtmqtt" ]; then
-            continue
-        fi
+        [ "$module" == "qtmqtt" ] && continue
         local ARCHIVE="${module}-everywhere-src-${QT_VERSION}.tar.xz"
         if [ ! -d "$QT_SRC_DIR/${module}-everywhere-src-${QT_VERSION}" ]; then
             echo -e "${GREEN}  Téléchargement $module...${NC}"
@@ -339,12 +355,15 @@ download_qt_sources() {
         fi
     done
 
-    # qtmqtt : repo git externe, pas de tarball officiel Qt 6
+    # qtmqtt : repo git externe (pas de tarball officiel Qt 6)
+    # IMPORTANT : utiliser le tag exact v${QT_VERSION} (pas la branche ${QT_VERSION_SHORT})
+    # La branche pointe sur la dernière version de maintenance (ex: 6.10.3)
+    # ce qui est incompatible avec Qt 6.10.0 compilé.
     if [ ! -d "$QT_SRC_DIR/qtmqtt" ]; then
-        echo -e "${GREEN}  Clonage qtmqtt (repo externe)...${NC}"
+        echo -e "${GREEN}  Clonage qtmqtt (repo externe, tag v${QT_VERSION})...${NC}"
         executer_locale "cd $QT_SRC_DIR && \
             git clone https://code.qt.io/qt/qtmqtt.git \
-            -b ${QT_VERSION_SHORT} --depth 1 qtmqtt"
+            -b v${QT_VERSION} --depth 1 qtmqtt"
     else
         echo -e "${GREEN}  qtmqtt déjà présent.${NC}"
     fi
@@ -352,17 +371,16 @@ download_qt_sources() {
 
 # ==============================================================================
 # BUILD HOST — qtbase + qtshadertools pour x86_64
-# Obligatoire en Qt 6 : fournit moc, rcc, qmake, qt-configure-module, etc.
+# Obligatoire : fournit moc, rcc, qmake, qt-configure-module
 # ==============================================================================
 build_qt_host() {
     echo -e "${GREEN}=== BUILD HOST (x86_64) ===${NC}"
     echo -e "${GREEN}    Fournit les outils de build pour la cross-compilation${NC}"
 
-    # --- qtbase host ---
+    # qtbase host
     if [ ! -f "$QT_HOST_INSTALL/bin/qmake" ]; then
         executer_locale "mkdir -p $QT_HOST_BUILD/qtbase"
         executer_locale "rm -rf $QT_HOST_BUILD/qtbase/*"
-
         executer_locale "
             cd $QT_HOST_BUILD/qtbase && \
             cmake $QT_SRC_DIR/qtbase-everywhere-src-${QT_VERSION} \
@@ -374,14 +392,14 @@ build_qt_host() {
         "
         executer_locale "cmake --build $QT_HOST_BUILD/qtbase --parallel $(nproc)"
         executer_locale "cmake --install $QT_HOST_BUILD/qtbase"
-        echo -e "${GREEN}  qtbase host installé : $QT_HOST_INSTALL${NC}"
+        echo -e "${GREEN}  qtbase host : OK${NC}"
     else
         echo -e "${GREEN}  qtbase host déjà compilé.${NC}"
     fi
 
-    # --- qtshadertools host ---
-    # Requis pour compiler qtdeclarative (QML shaders)
-    if [ ! -f "$QT_HOST_INSTALL/lib/cmake/Qt6ShaderTools/Qt6ShaderToolsConfig.cmake" ]; then
+    # qtshadertools host — requis avant qtdeclarative
+    local SHADERTOOLS_CMAKE="$QT_HOST_INSTALL/lib/cmake/Qt6ShaderTools/Qt6ShaderToolsConfig.cmake"
+    if [ ! -f "$SHADERTOOLS_CMAKE" ]; then
         local SHADERTOOLS_SRC="$QT_SRC_DIR/qtshadertools-everywhere-src-${QT_VERSION}"
         executer_locale "mkdir -p $QT_HOST_BUILD/qtshadertools"
         executer_locale "rm -rf $QT_HOST_BUILD/qtshadertools/*"
@@ -391,26 +409,66 @@ build_qt_host() {
             cmake --build . --parallel $(nproc) && \
             cmake --install .
         "
-        echo -e "${GREEN}  qtshadertools host installé.${NC}"
+        echo -e "${GREEN}  qtshadertools host : OK${NC}"
     else
         echo -e "${GREEN}  qtshadertools host déjà compilé.${NC}"
+    fi
+
+    # qtdeclarative host — requis pour fournir Qt6QmlTools au build target
+    # Sans cela : "Failed to find host tool Qt6::qmlaotstats"
+    local QDECL_HOST_CMAKE="$QT_HOST_INSTALL/lib/cmake/Qt6Qml/Qt6QmlConfig.cmake"
+    if [ ! -f "$QDECL_HOST_CMAKE" ]; then
+        local QDECL_SRC="$QT_SRC_DIR/qtdeclarative-everywhere-src-${QT_VERSION}"
+        executer_locale "mkdir -p $QT_HOST_BUILD/qtdeclarative"
+        executer_locale "rm -rf $QT_HOST_BUILD/qtdeclarative/*"
+        executer_locale "
+            cd $QT_HOST_BUILD/qtdeclarative && \
+            $QT_HOST_INSTALL/bin/qt-configure-module $QDECL_SRC && \
+            cmake --build . --parallel $(nproc) && \
+            cmake --install .
+        "
+        echo -e "${GREEN}  qtdeclarative host : OK${NC}"
+    else
+        echo -e "${GREEN}  qtdeclarative host déjà compilé.${NC}"
     fi
 }
 
 # ==============================================================================
-# BUILD TARGET qtbase — QMYSQL + SQLite activés ici
+# BUILD TARGET qtbase — QMYSQL + SQLite
 # ==============================================================================
 build_qt_target_base() {
     echo -e "${GREEN}=== BUILD TARGET qtbase (${ARCH_BITS} bits) ===${NC}"
     echo -e "${GREEN}    SQL : -DQT_FEATURE_sql_sqlite=ON -DQT_FEATURE_sql_mysql=ON${NC}"
 
-    # Résoudre le chemin exact de libmariadb.so pour CMake
+    # Résoudre le chemin exact de libmariadb.so
     local MYSQL_LIB_PATH="$MYSQL_LIBDIR/libmariadb.so"
     if [ ! -f "$MYSQL_LIB_PATH" ]; then
         MYSQL_LIB_PATH=$(find "$SYSROOT" \
             -name "libmariadb*.so*" 2>/dev/null | head -1)
     fi
     echo -e "${GREEN}  MySQL lib CMake : $MYSQL_LIB_PATH${NC}"
+
+    # ------------------------------------------------------------------
+    # Correction md4c : Qt 6 cherche la lib système md4c via son cmake
+    # config. Sur Bookworm, libmd4c-html0 n'est pas un paquet séparé —
+    # libmd4c-html.so.x est inclus dans libmd4c0. Le cmake config est
+    # présent dans le sysroot mais référence un .so qui n'y est pas,
+    # car le lien symbolique .so (sans version) n'est créé que par
+    # libmd4c-dev, et le .so.x.x.x versioned est dans libmd4c0.
+    #
+    # Solution robuste : supprimer le cmake config md4c du sysroot.
+    # Qt utilisera alors sa version bundled de md4c (toujours à jour).
+    # ------------------------------------------------------------------
+    echo -e "${GREEN}=== Correction md4c sysroot ===${NC}"
+    local MD4C_CMAKE="$SYSROOT/usr/lib/$PKG_CONFIG_ARCH_PATH/cmake/md4c"
+    if [ -d "$MD4C_CMAKE" ]; then
+        echo -e "${YELLOW}  Suppression $MD4C_CMAKE${NC}"
+        echo -e "${YELLOW}  → Qt utilisera sa version bundled de md4c${NC}"
+        rm -rf "$MD4C_CMAKE"
+        echo -e "${GREEN}  [OK] cmake config md4c supprimé du sysroot${NC}"
+    else
+        echo -e "${GREEN}  cmake config md4c absent — rien à faire${NC}"
+    fi
 
     executer_locale "mkdir -p $QT_TARGET_BUILD/qtbase"
     executer_locale "rm -rf $QT_TARGET_BUILD/qtbase/*"
@@ -439,30 +497,31 @@ build_qt_target_base() {
             -DQT_FEATURE_sql_mysql=ON \
             -DMySQL_INCLUDE_DIR=$MYSQL_INCDIR \
             -DMySQL_LIBRARY=$MYSQL_LIB_PATH \
-            -DQT_QMAKE_TARGET_MKSPEC=devices/$QT_DEVICE_MK
+            -DQT_QMAKE_TARGET_MKSPEC=devices/$QT_DEVICE_MK \
+            "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined" \
+            "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--allow-shlib-undefined"
     "
 
     executer_locale "cmake --build $QT_TARGET_BUILD/qtbase --parallel $(nproc)"
     executer_locale "cmake --install $QT_TARGET_BUILD/qtbase"
 
-    # Vérification plugins SQL produits
+    # Vérification plugins SQL
     echo -e "${GREEN}=== Vérification plugins SQL ===${NC}"
-    find "$QT_TARGET_STAGING" -name "libqsqlmysql*" 2>/dev/null | head -3 \
+    find "$QT_TARGET_STAGING" -name "libqsqlmysql*" 2>/dev/null | grep -q . \
         && echo -e "${GREEN}  [OK] libqsqlmysql trouvé${NC}" \
-        || echo -e "${RED}  [KO] libqsqlmysql ABSENT — vérifiez les logs CMake${NC}"
-    find "$QT_TARGET_STAGING" -name "libqsqlite*" 2>/dev/null | head -3 \
+        || echo -e "${RED}  [KO] libqsqlmysql ABSENT${NC}"
+    find "$QT_TARGET_STAGING" -name "libqsqlite*" 2>/dev/null | grep -q . \
         && echo -e "${GREEN}  [OK] libqsqlite trouvé${NC}" \
         || echo -e "${RED}  [KO] libqsqlite ABSENT${NC}"
 
-    # Vérification qmake généré
-    echo -e "${GREEN}=== Vérification qmake ===${NC}"
-    find "$QT_TARGET_STAGING" -name "qmake*" 2>/dev/null | head -3 \
+    # Vérification qmake
+    find "$QT_TARGET_STAGING" -name "qmake*" -type f 2>/dev/null | grep -q . \
         && echo -e "${GREEN}  [OK] qmake présent${NC}" \
         || echo -e "${YELLOW}  [INFO] qmake non trouvé dans staging${NC}"
 }
 
 # ==============================================================================
-# BUILD TARGET — module Qt supplémentaire
+# BUILD TARGET — un module Qt supplémentaire
 # ==============================================================================
 build_qt_target_module() {
     local MODULE="$1"
@@ -473,9 +532,17 @@ build_qt_target_module() {
     executer_locale "mkdir -p $QT_TARGET_BUILD/$MODULE"
     executer_locale "rm -rf $QT_TARGET_BUILD/$MODULE/*"
 
+    # qt-configure-module génère le CMakeLists racine puis appelle cmake.
+    # Les flags -D doivent être passés à cmake APRÈS qt-configure-module
+    # via --cmake-arg ou en surchargeant la cache cmake.
+    # On utilise --cmake-arg pour passer QT_BUILD_TOOLS_WHEN_CROSSCOMPILING=OFF
+    # qui évite de compiler les exécutables ARM (qml, qmlscene...) sur le PC hôte.
+    # Le linker croisé ne peut pas les linker à cause de arc4random_buf@GLIBC_2.36
+    # dans libexpat du sysroot Bookworm.
     executer_locale "
         cd $QT_TARGET_BUILD/$MODULE && \
-        $QT_TARGET_STAGING/bin/qt-configure-module $SRC_PATH && \
+        $QT_TARGET_STAGING/bin/qt-configure-module $SRC_PATH \
+            -- -DQT_BUILD_TOOLS_WHEN_CROSSCOMPILING=OFF && \
         cmake --build . --parallel $(nproc) && \
         cmake --install .
     "
@@ -573,6 +640,9 @@ executer_distante "
         libopenal-dev libasound2-dev libpulse-dev \
         bluez-tools libbluetooth-dev libffi-dev
     sudo apt install -y '^libxcb.*-dev' || true
+    # libmd4c : rendu Markdown dans Qt — DOIT être installé avant rsync
+    # Sans cela cmake Qt6 target échoue : "md4c::md4c-html references .so but file does not exist"
+    sudo apt install -y libmd4c-dev libmd4c-html0
 "
 
 # --- MariaDB dev — DOIT être AVANT le rsync ---
@@ -616,11 +686,13 @@ for SYM_SRC in \
     "/usr/include/$PKG_CONFIG_ARCH_PATH/sys" \
     "/usr/include/$PKG_CONFIG_ARCH_PATH/openssl"; do
     ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" "
-        [ -d '$SYM_SRC' ] \
-            && /tmp/SSymlinker -s '$SYM_SRC' -d /usr/include \
+        if [ -d '$SYM_SRC' ]; then
+            /tmp/SSymlinker -s '$SYM_SRC' -d /usr/include \
                 && echo '  [OK]   $SYM_SRC' \
-                || echo '  [WARN] Lien existant : $SYM_SRC' \
-            || echo '  [SKIP] Absent : $SYM_SRC'
+                || echo '  [WARN] Lien existant : $SYM_SRC'
+        else
+            echo '  [SKIP] Absent : $SYM_SRC'
+        fi
     "
 done
 for SYM_SRC in \
@@ -629,11 +701,13 @@ for SYM_SRC in \
     "/usr/lib/$PKG_CONFIG_ARCH_PATH/crti.o"; do
     SYM_DST="/usr/lib/$(basename $SYM_SRC)"
     ssh -p "$RPI_PORT" "$RPI_USER@$RPI_HOST" "
-        [ -f '$SYM_SRC' ] \
-            && /tmp/SSymlinker -s '$SYM_SRC' -d '$SYM_DST' \
+        if [ -f '$SYM_SRC' ]; then
+            /tmp/SSymlinker -s '$SYM_SRC' -d '$SYM_DST' \
                 && echo '  [OK]   $SYM_SRC' \
-                || echo '  [WARN] Lien existant : $SYM_SRC' \
-            || echo '  [SKIP] Absent : $SYM_SRC'
+                || echo '  [WARN] Lien existant : $SYM_SRC'
+        else
+            echo '  [SKIP] Absent : $SYM_SRC'
+        fi
     "
 done
 
@@ -661,15 +735,23 @@ CMAKE_MAJOR=$(echo "$CMAKE_VER" | cut -d. -f1)
 CMAKE_MINOR=$(echo "$CMAKE_VER" | cut -d. -f2)
 if [ "$CMAKE_MAJOR" -lt 3 ] || \
    ([ "$CMAKE_MAJOR" -eq 3 ] && [ "$CMAKE_MINOR" -lt 19 ]); then
-    echo -e "${RED}cmake $CMAKE_VER insuffisant (< 3.19) !${NC}"
-    echo -e "${RED}Installez cmake >= 3.19 manuellement puis relancez.${NC}"
+    echo -e "${RED}cmake $CMAKE_VER insuffisant — Qt 6 nécessite >= 3.19${NC}"
     exit 1
 fi
 echo -e "${GREEN}  cmake $CMAKE_VER : OK${NC}"
 
+# Vérification ninja
+if ! command -v ninja &>/dev/null; then
+    echo -e "${RED}ninja introuvable — installation...${NC}"
+    executer_locale "sudo apt install -y ninja-build"
+fi
+echo -e "${GREEN}  ninja $(ninja --version) : OK${NC}"
+
 executer_locale "mkdir -p \
     $QT_SRC_DIR \
-    $QT_HOST_BUILD \
+    $QT_HOST_BUILD/qtbase \
+    $QT_HOST_BUILD/qtshadertools \
+    $QT_HOST_BUILD/qtdeclarative \
     $QT_HOST_INSTALL \
     $QT_TARGET_BUILD \
     $QT_TARGET_STAGING \
@@ -681,7 +763,7 @@ install_cross_toolchain
 
 # ==============================================================================
 # Partie 3 : Synchronisation sysroot depuis le RPi
-# APRÈS installation MariaDB (Partie 1)
+# APRÈS installation MariaDB (Partie 1) → headers inclus
 # ==============================================================================
 echo -e "${GREEN}=== Partie 3 : Synchronisation sysroot ===${NC}"
 echo -e "${GREEN}    (headers MariaDB inclus dans ce rsync)${NC}"
@@ -715,30 +797,24 @@ generate_toolchain_cmake
 download_qt_sources
 
 # ==============================================================================
-# Partie 5 : Build HOST (x86_64)
-# Fournit moc, rcc, qmake, qt-configure-module pour la cross-compilation
+# Partie 5 : BUILD HOST (x86_64)
 # ==============================================================================
 build_qt_host
 
 # ==============================================================================
-# Partie 6 : Build TARGET qtbase — avec QMYSQL + SQLite
+# Partie 6 : BUILD TARGET qtbase + QMYSQL + SQLite
 # ==============================================================================
 build_qt_target_base
 
 # ==============================================================================
-# Partie 7 : Build TARGET modules supplémentaires
+# Partie 7 : BUILD TARGET modules supplémentaires
 # ==============================================================================
 echo -e "${YELLOW}=== Partie 7 : BUILD TARGET modules ===${NC}"
 
 for module in "${MODULES_TO_BUILD[@]}"; do
-    # qtshadertools et qtbase déjà compilés
-    [ "$module" == "qtshadertools" ] && continue
+    # qtshadertools doit être compilé pour le TARGET aussi
+    # (build_qt_host le compile uniquement pour x86 host)
 
-    MODULE_ENTRY="${QT_MODULES[$module]}"
-    url="${MODULE_ENTRY%%|*}"
-    version="${MODULE_ENTRY##*|}"
-
-    # Chemin source : tarball extrait ou clone git
     if [ "$module" == "qtmqtt" ]; then
         SRC_PATH="$QT_SRC_DIR/qtmqtt"
     else
@@ -764,21 +840,20 @@ executer_locale "rsync -avz --rsync-path='sudo rsync' \
 executer_distante "
     echo '$QT_TARGET_PREFIX/lib' | sudo tee /etc/ld.so.conf.d/qt6pi.conf
     sudo ldconfig
-    if ! grep -q '$QT_TARGET_PREFIX/bin' ~/.bashrc 2>/dev/null; then
+    grep -q '$QT_TARGET_PREFIX/bin' ~/.bashrc 2>/dev/null || {
         echo 'export PATH=\$PATH:$QT_TARGET_PREFIX/bin' >> ~/.bashrc
         echo 'export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:$QT_TARGET_PREFIX/lib' >> ~/.bashrc
-    fi
+    }
     echo ''
     echo '--- Plugins SQL déployés ---'
     find $QT_TARGET_PREFIX/plugins/sqldrivers -name 'libqsql*' 2>/dev/null \
-        || echo 'Plugins sqldrivers non trouvés'
+        || echo 'Dossier sqldrivers non trouvé'
     echo ''
     echo '--- Runtime libmariadb ---'
-    ldconfig -p | grep mariadb || echo 'libmariadb non trouvée dans ldconfig'
+    ldconfig -p | grep mariadb || echo 'libmariadb non trouvée'
     echo ''
     echo '--- qmake ---'
-    $QT_TARGET_PREFIX/bin/qmake --version 2>/dev/null \
-        || echo 'qmake non trouvé dans PATH'
+    $QT_TARGET_PREFIX/bin/qmake --version 2>/dev/null || echo 'qmake non trouvé'
 "
 
 # ==============================================================================
@@ -794,19 +869,19 @@ echo -e "${GREEN}  Qt staging PC  : $QT_TARGET_STAGING                        ${
 echo -e "${GREEN}  Qt sur RPi     : $QT_TARGET_PREFIX                         ${NC}"
 echo -e "${GREEN}  toolchain.cmake: $TOOLCHAIN_FILE                           ${NC}"
 echo ""
-echo -e "${YELLOW}  Qt Creator — cross-compilation :                          ${NC}"
+echo -e "${YELLOW}  Qt Creator — paramètres cross-compilation :               ${NC}"
 echo -e "${YELLOW}    Toolchain cmake :                                        ${NC}"
 echo -e "${YELLOW}      $TOOLCHAIN_FILE                                        ${NC}"
-echo -e "${YELLOW}    Qt version (target) :                                    ${NC}"
+echo -e "${YELLOW}    Qt version (CMake) :                                     ${NC}"
 echo -e "${YELLOW}      $QT_TARGET_STAGING/lib/cmake/Qt6/qt.toolchain.cmake   ${NC}"
-echo -e "${YELLOW}    qmake (target) :                                         ${NC}"
+echo -e "${YELLOW}    qmake (projets .pro) :                                   ${NC}"
 echo -e "${YELLOW}      $QT_TARGET_STAGING/bin/qmake                          ${NC}"
 echo ""
-echo -e "${YELLOW}  Dans votre CMakeLists.txt :                                ${NC}"
+echo -e "${YELLOW}  CMakeLists.txt :                                           ${NC}"
 echo -e "${YELLOW}    find_package(Qt6 REQUIRED COMPONENTS Core Sql)          ${NC}"
-echo -e "${YELLOW}    target_link_libraries(monapp PRIVATE Qt6::Core Qt6::Sql)${NC}"
+echo -e "${YELLOW}    target_link_libraries(app PRIVATE Qt6::Core Qt6::Sql)   ${NC}"
 echo ""
-echo -e "${YELLOW}  Dans votre .pro (qmake) :                                  ${NC}"
+echo -e "${YELLOW}  Fichier .pro (qmake) :                                     ${NC}"
 echo -e "${YELLOW}    QT += sql                                                ${NC}"
 echo ""
 echo -e "${YELLOW}  Vérifier les drivers au runtime :                         ${NC}"
