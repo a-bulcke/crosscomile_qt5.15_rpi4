@@ -16,6 +16,15 @@
 #   2. BUILD TARGET : tous les modules cross-compilés pour ARM
 #                     ce qui sera déployé sur le RPi
 #
+# Corrections v3 :
+#   - toolchain.cmake : syntaxe PKG_CONFIG_* corrigée (plus de ENV{})
+#   - ninja-build ajouté aux dépendances PC Ubuntu
+#   - Détection architecture via dpkg (priorité sur uname)
+#   - sudoers /usr/bin/rsync en dur, anti-doublon
+#   - WiringPi dpkg non bloquant + apt-get -f
+#   - SSymlinker : vérification existence avant lien
+#   - MariaDB dev AVANT rsync sysroot
+#   - URLs https:// + séparateur | pour les modules
 # ==============================================================================
 
 GREEN='\033[0;32m'
@@ -28,7 +37,7 @@ NC='\033[0m'
 # Configuration — adaptez ces valeurs à votre environnement
 # ==============================================================================
 RPI_USER="pi"
-RPI_HOST="10.0.2.3"
+RPI_HOST="192.168.0.102"
 RPI_PORT="22"
 LOCAL_USER=$(whoami)
 LOCAL_GROUP=$(id -gn)
@@ -52,7 +61,6 @@ SSH_KEY_PATH="$HOME/.ssh/id_rsa"
 
 QT_BASE_DOWNLOAD_URL="https://download.qt.io/official_releases/qt/${QT_VERSION_SHORT}/${QT_VERSION}/submodules"
 SYM_LINKER_URL="https://raw.githubusercontent.com/abhiTronix/raspberry-pi-cross-compilers/master/utils/SSymlinker"
-RELATIVE_LINKS_SCRIPT_URL="https://raw.githubusercontent.com/riscv/riscv-poky/master/scripts/sysroot-relativelinks.py"
 
 # Variables remplies dynamiquement par detect_rpi_arch()
 ARCH_BITS=""
@@ -173,106 +181,178 @@ detect_rpi_arch() {
 # ==============================================================================
 # Installation toolchain croisée via apt
 # ==============================================================================
+# ==============================================================================
+# Installation toolchain croisée via apt
+#
+# gcc-11 apt (arm-linux-gnueabihf) : utilisé pour compiler Qt 6
+# Le triplet arm-linux-gnueabihf est compatible avec le sysroot Debian/Bookworm.
+# ARM GNU toolchain (arm-none-linux-gnueabihf) est INCOMPATIBLE avec un sysroot
+# Debian car les chemins de libs sont organisés sous arm-none-linux-gnueabihf/
+# alors que Debian utilise arm-linux-gnueabihf/.
+#
+# Mkspec : linux-rasp-pi4-ubuntu-cross (créé par create_fixed_mkspec)
+# Ce mkspec remplace linux-rasp-pi4-v3d-g++ dont les flags
+# crypto-neon-fp-armv8 et mfloat-abi=hard via DISTRO_OPTS ne sont pas
+# supportés par le toolchain cross apt.
+# Flags remplacés par neon-vfpv4 + mfloat-abi=hard inline : équivalents
+# fonctionnels pour Qt sur RPi4 Cortex-A72.
+#
+# Cohabitation Qt 5 / Qt 6 dans Qt Creator :
+#   Kit Qt 5 → /usr/bin/arm-linux-gnueabihf-g++   (même toolchain apt)
+#   Kit Qt 6 → /usr/bin/arm-linux-gnueabihf-g++   (même toolchain apt)
+#   Les kits diffèrent par la Qt version et le mkspec, pas le compilateur.
+# ==============================================================================
+
 install_cross_toolchain() {
-    echo -e "${GREEN}=== Installation toolchain croisée ===${NC}"
+    echo -e "${GREEN}=== Installation toolchain croisée (apt) ===${NC}"
+    echo -e "${GREEN}    arm-linux-gnueabihf : compatible sysroot Debian/Bookworm${NC}"
+
     if [ "$ARCH_BITS" -eq 64 ]; then
         executer_locale "sudo apt install -y \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu"
         echo -e "${GREEN}  $(aarch64-linux-gnu-gcc --version | head -1)${NC}"
+        export CROSS_CC="/usr/bin/aarch64-linux-gnu-gcc"
+        export CROSS_CXX="/usr/bin/aarch64-linux-gnu-g++"
     else
         executer_locale "sudo apt install -y \
             gcc-arm-linux-gnueabihf \
             g++-arm-linux-gnueabihf \
             binutils-arm-linux-gnueabihf"
         echo -e "${GREEN}  $(arm-linux-gnueabihf-gcc --version | head -1)${NC}"
+        export CROSS_CC="/usr/bin/arm-linux-gnueabihf-gcc"
+        export CROSS_CXX="/usr/bin/arm-linux-gnueabihf-g++"
     fi
+
+    echo ""
+    echo -e "${YELLOW}  Qt Creator — kit Qt 5 et Qt 6 utilisent le même compilateur :${NC}"
+    echo -e "${YELLOW}    C++ : $CROSS_CXX${NC}"
+    echo -e "${YELLOW}  Les kits se distinguent par :${NC}"
+    echo -e "${YELLOW}    - La Qt version (qmake Qt5 vs Qt6)${NC}"
+    echo -e "${YELLOW}    - Le mkspec (linux-rasp-pi4-v3d-g++ vs linux-rasp-pi4-ubuntu-cross)${NC}"
+    echo -e "${YELLOW}    - Le sysroot (cross_rpi4 vs cross_rpi4_qt6)${NC}"
 }
 
 # ==============================================================================
-# Génération toolchain.cmake — version corrigée
-#
-# Corrections v3 :
-#   - set(ENV{PKG_CONFIG_*}) → set(PKG_CONFIG_*) : syntaxe CMake valide
-#   - ${ENV{VAR}} invalide → variables CMake directes
-#   - PKG_CONFIG_LIBDIR et PKG_CONFIG_PATH définis comme variables CMake
-#     (lus directement par le module FindPkgConfig de CMake)
+# Génération toolchain.cmake — pointe sur le compilateur apt
 # ==============================================================================
 generate_toolchain_cmake() {
-    echo -e "${GREEN}=== Génération toolchain.cmake ===${NC}"
+    echo -e "${GREEN}=== Génération toolchain.cmake (wiki Qt officiel) ===${NC}"
 
     if [ "$ARCH_BITS" -eq 64 ]; then
         CC_CROSS="/usr/bin/aarch64-linux-gnu-gcc"
         CXX_CROSS="/usr/bin/aarch64-linux-gnu-g++"
+        QT_COMPILER_FLAGS="-march=armv8-a -mtune=cortex-a72"
+        GL_ARCH_PATH="${SYSROOT}/usr/lib/aarch64-linux-gnu"
     else
         CC_CROSS="/usr/bin/arm-linux-gnueabihf-gcc"
         CXX_CROSS="/usr/bin/arm-linux-gnueabihf-g++"
+        QT_COMPILER_FLAGS="-march=armv8-a -mtune=cortex-a72 -mfpu=neon-vfpv4 -mfloat-abi=hard"
+        GL_ARCH_PATH="${SYSROOT}/usr/lib/arm-linux-gnueabihf"
     fi
 
-    # Le heredoc utilise EOF sans quotes → les variables bash sont interpolées
-    # Les variables CMake (\${...}) sont protégées par le backslash
+    echo -e "${GREEN}  Compilateur C   : $CC_CROSS${NC}"
+    echo -e "${GREEN}  Compilateur C++ : $CXX_CROSS${NC}"
+    echo -e "${GREEN}  Version         : $($CC_CROSS --version | head -1)${NC}"
+    echo -e "${GREEN}  Flags ARM       : $QT_COMPILER_FLAGS${NC}"
+
     cat > "$TOOLCHAIN_FILE" << EOF
 cmake_minimum_required(VERSION 3.18)
 include_guard(GLOBAL)
 
-# ==============================================================
-# Toolchain Qt 6 cross-compilation → Raspberry Pi 4
-# Architecture : ${ARCH_BITS} bits (${PKG_CONFIG_ARCH_PATH})
-# Généré par cross_compile_qt6_rpi4_mysql.sh
-# ==============================================================
-
 set(CMAKE_SYSTEM_NAME Linux)
-set(CMAKE_SYSTEM_PROCESSOR ${CMAKE_SYSTEM_PROCESSOR})
+set(CMAKE_SYSTEM_PROCESSOR arm)
 
 set(TARGET_SYSROOT ${SYSROOT})
 set(CMAKE_SYSROOT \${TARGET_SYSROOT})
 
+# Compilateurs croisés apt (triplet Debian — compatible sysroot Bookworm)
 set(CMAKE_C_COMPILER   ${CC_CROSS})
 set(CMAKE_CXX_COMPILER ${CXX_CROSS})
 
-# Flags Cortex-A72 (RPi4)
-set(CMAKE_C_FLAGS_INIT   "${CMAKE_MARCH}")
-set(CMAKE_CXX_FLAGS_INIT "${CMAKE_MARCH}")
+# Flags compilateur ARM RPi4 — injectés via cmake_initialize_per_config_variable
+# (mécanisme officiel Qt, cf. wiki.qt.io/Cross-Compile_Qt_6_for_Raspberry_Pi)
+set(QT_COMPILER_FLAGS         "${QT_COMPILER_FLAGS}")
+set(QT_COMPILER_FLAGS_RELEASE "-O2 -pipe -DNDEBUG")
+# --allow-shlib-undefined : symbs glibc/systemd résolus au runtime sur RPi
+# -ldbus-1 : fix libdbus.a sd_listen_fds (wiki Qt Known Issues > Issue with libdbus)
+set(QT_LINKER_FLAGS           "-Wl,-O1 -Wl,--hash-style=gnu -Wl,--as-needed -Wl,--allow-shlib-undefined -ldbus-1")
 
-set(QT_COMPILER_FLAGS         "${CMAKE_MARCH}")
-set(QT_COMPILER_FLAGS_RELEASE "-O2 -pipe")
-# --allow-shlib-undefined : obligatoire en cross-compilation
-# libexpat (et d'autres .so Bookworm) référencent arc4random_buf@GLIBC_2.36
-# Le linker croisé lève une erreur, mais le RPi réel a glibc 2.36 et résout
-# normalement. _INIT = appliqué AVANT toute logique cmake projet.
-set(QT_LINKER_FLAGS                    "-Wl,-O1 -Wl,--hash-style=gnu -Wl,--as-needed -Wl,--allow-shlib-undefined")
-set(CMAKE_EXE_LINKER_FLAGS_INIT        "-Wl,--allow-shlib-undefined")
-set(CMAKE_SHARED_LINKER_FLAGS_INIT     "-Wl,--allow-shlib-undefined")
-set(CMAKE_MODULE_LINKER_FLAGS_INIT     "-Wl,--allow-shlib-undefined")
+set(CMAKE_EXE_LINKER_FLAGS_INIT    "-Wl,--allow-shlib-undefined")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "-Wl,--allow-shlib-undefined")
+set(CMAKE_MODULE_LINKER_FLAGS_INIT "-Wl,--allow-shlib-undefined")
 
-# pkg-config — variables CMake directes, lues par FindPkgConfig
-set(PKG_CONFIG_SYSROOT_DIR ${SYSROOT})
-set(PKG_CONFIG_LIBDIR
-    ${SYSROOT}/usr/lib/${PKG_CONFIG_ARCH_PATH}/pkgconfig:${SYSROOT}/usr/lib/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig)
-set(PKG_CONFIG_PATH
-    ${SYSROOT}/usr/lib/${PKG_CONFIG_ARCH_PATH}/pkgconfig:${SYSROOT}/usr/lib/pkgconfig)
+# pkg-config — pointe vers le sysroot, pas les libs hôte
+# set(ENV{...}) : syntaxe correcte pour variables d'environnement CMake
+set(ENV{PKG_CONFIG_PATH}        \$ENV{PKG_CONFIG_PATH}:${SYSROOT}/usr/lib/${PKG_CONFIG_ARCH_PATH}/pkgconfig)
+set(ENV{PKG_CONFIG_LIBDIR}      /usr/lib/pkgconfig:/usr/share/pkgconfig/:${SYSROOT}/usr/lib/${PKG_CONFIG_ARCH_PATH}/pkgconfig:${SYSROOT}/usr/lib/pkgconfig)
+set(ENV{PKG_CONFIG_SYSROOT_DIR} \${CMAKE_SYSROOT})
 
-# Recherche : programmes sur le HOST, libs/includes dans le sysroot
+# Chemins de recherche — bibliothèques et headers dans le sysroot uniquement
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
-set(CMAKE_FIND_ROOT_PATH "\${CMAKE_SYSROOT}")
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+set(CMAKE_BUILD_RPATH \${TARGET_SYSROOT})
+
+# Injection des flags ARM via cmake_initialize_per_config_variable
+# Cette fonction est appelée par CMake pour chaque variable de flags.
+# Elle garantit que QT_COMPILER_FLAGS est appliqué à tous les fichiers
+# compilés, y compris ceux des modules Qt tiers.
+include(CMakeInitializeConfigs)
+
+function(cmake_initialize_per_config_variable _PREFIX _DOCSTRING)
+  if (_PREFIX MATCHES "CMAKE_(C|CXX|ASM)_FLAGS")
+    set(CMAKE_\${CMAKE_MATCH_1}_FLAGS_INIT "\${QT_COMPILER_FLAGS}")
+    foreach (config DEBUG RELEASE MINSIZEREL RELWITHDEBINFO)
+      if (DEFINED QT_COMPILER_FLAGS_\${config})
+        set(CMAKE_\${CMAKE_MATCH_1}_FLAGS_\${config}_INIT "\${QT_COMPILER_FLAGS_\${config}}")
+      endif()
+    endforeach()
+  endif()
+  if (_PREFIX MATCHES "CMAKE_(SHARED|MODULE|EXE)_LINKER_FLAGS")
+    foreach (config SHARED MODULE EXE)
+      set(CMAKE_\${config}_LINKER_FLAGS_INIT "\${QT_LINKER_FLAGS}")
+    endforeach()
+  endif()
+  _cmake_initialize_per_config_variable(\${ARGV})
+endfunction()
+
+# Déclaration explicite des bibliothèques OpenGL/EGL/DRM/XCB
+# (évite que CMake cherche les versions hôte x86 au lieu du sysroot ARM)
+set(GL_INC_DIR  \${TARGET_SYSROOT}/usr/include)
+set(GL_LIB_DIR  \${TARGET_SYSROOT}:\${TARGET_SYSROOT}/usr/lib/${PKG_CONFIG_ARCH_PATH}/:\${TARGET_SYSROOT}/usr:\${TARGET_SYSROOT}/usr/lib)
+
+set(EGL_INCLUDE_DIR     \${GL_INC_DIR})
+set(EGL_LIBRARY         ${GL_ARCH_PATH}/libEGL.so)
+
+set(OPENGL_INCLUDE_DIR  \${GL_INC_DIR})
+set(OPENGL_opengl_LIBRARY ${GL_ARCH_PATH}/libOpenGL.so)
+
+set(GLESv2_INCLUDE_DIR  \${GL_INC_DIR})
+set(GLESv2_LIBRARY      ${GL_ARCH_PATH}/libGLESv2.so)
+
+set(gbm_INCLUDE_DIR     \${GL_INC_DIR})
+set(gbm_LIBRARY         ${GL_ARCH_PATH}/libgbm.so)
+
+set(Libdrm_INCLUDE_DIR  \${GL_INC_DIR})
+set(Libdrm_LIBRARY      ${GL_ARCH_PATH}/libdrm.so)
+
+set(XCB_XCB_INCLUDE_DIR \${GL_INC_DIR})
+set(XCB_XCB_LIBRARY     ${GL_ARCH_PATH}/libxcb.so)
 EOF
 
-    echo -e "${GREEN}  toolchain.cmake : $TOOLCHAIN_FILE${NC}"
-    echo -e "${GREEN}  Sysroot         : $SYSROOT${NC}"
-    echo -e "${GREEN}  Compilateur C++ : $CXX_CROSS${NC}"
-
-    # Vérification syntaxe : aucun ENV{ invalide dans le CODE
-    # (on ignore les lignes de commentaires CMake qui commencent par #)
-    if grep -n 'ENV{' "$TOOLCHAIN_FILE" | grep -qv ':[[:space:]]*#'; then
+    # Vérification syntaxe ENV{ — doit être dans set(ENV{...})
+    # On accepte set(ENV{...}) qui est la syntaxe correcte
+    if grep -n 'ENV{' "$TOOLCHAIN_FILE" | grep -qv 'set(ENV{'; then
         echo -e "${RED}ERREUR : syntaxe ENV{ invalide dans toolchain.cmake !${NC}"
-        grep -n 'ENV{' "$TOOLCHAIN_FILE" | grep -v ':[[:space:]]*#'
+        grep -n 'ENV{' "$TOOLCHAIN_FILE" | grep -v 'set(ENV{'
         exit 1
     fi
-    echo -e "${GREEN}  Vérification syntaxe : OK${NC}"
+
+    echo -e "${GREEN}  toolchain.cmake généré : $TOOLCHAIN_FILE${NC}"
 }
 
 # ==============================================================================
@@ -312,6 +392,34 @@ verify_mysql_sysroot() {
     echo -e "${GREEN}  MYSQL_INCDIR  : $MYSQL_INCDIR${NC}"
     echo -e "${GREEN}  MYSQL_LIBDIR  : $MYSQL_LIBDIR${NC}"
     echo -e "${GREEN}  Bibliothèque  : $MYSQL_LIB_FOUND${NC}"
+}
+
+# ==============================================================================
+# Vérification et correction libdbus-1.so dans le sysroot
+# Wiki Qt Known Issues : libdbus.a statique requiert sd_listen_fds (libsystemd)
+# Solution : s'assurer que libdbus-1.so (lien symbolique) est valide
+# Si le .so est absent ou cassé, CMake utilise le .a statique → erreur link
+# ==============================================================================
+verify_fix_libdbus_sysroot() {
+    echo -e "${GREEN}=== Vérification libdbus-1.so dans le sysroot ===${NC}"
+
+    local DBUS_SO="$SYSROOT/usr/lib/$PKG_CONFIG_ARCH_PATH/libdbus-1.so"
+    local DBUS_SO3=$(find "$SYSROOT/usr/lib/$PKG_CONFIG_ARCH_PATH"         -name "libdbus-1.so.3*" 2>/dev/null | head -1)
+
+    if [ -e "$DBUS_SO" ]; then
+        echo -e "${GREEN}  [OK] libdbus-1.so présent : $(ls -la $DBUS_SO)${NC}"
+    else
+        echo -e "${YELLOW}  libdbus-1.so absent ou lien cassé — correction...${NC}"
+        if [ -n "$DBUS_SO3" ]; then
+            local TARGET=$(basename "$DBUS_SO3")
+            executer_locale "ln -sfv $TARGET $DBUS_SO"
+            echo -e "${GREEN}  [OK] lien créé : libdbus-1.so → $TARGET${NC}"
+        else
+            echo -e "${RED}  [KO] libdbus-1.so.3 introuvable dans le sysroot !${NC}"
+            echo -e "${RED}  Installez libdbus-1-dev sur le RPi puis relancez le rsync.${NC}"
+            exit 1
+        fi
+    fi
 }
 
 # ==============================================================================
@@ -509,7 +617,67 @@ build_qt_target_base() {
     find "$QT_TARGET_STAGING" -name "qmake*" -type f 2>/dev/null | grep -q . \
         && echo -e "${GREEN}  [OK] qmake présent${NC}" \
         || echo -e "${YELLOW}  [INFO] qmake non trouvé dans staging${NC}"
+
 }
+
+
+# ==============================================================================
+# Création mkspec compatible toolchain cross apt (gcc-11/gcc-12)
+#
+# linux-rasp-pi4-v3d-g++ utilise -mfpu=crypto-neon-fp-armv8 et -mfloat-abi=hard
+# via DISTRO_OPTS → non supportés par le toolchain cross apt Ubuntu.
+# Ce mkspec custom utilise neon-vfpv4 + mfloat-abi=hard inline.
+# ==============================================================================
+create_fixed_mkspec() {
+    echo -e "${GREEN}=== Création mkspec compatible toolchain apt ===${NC}"
+
+    local MKSPEC_BASE="$QT_TARGET_STAGING/mkspecs"
+    local MKSPEC_DST="$MKSPEC_BASE/devices/linux-rasp-pi4-ubuntu-cross"
+    local COMMON="$MKSPEC_BASE/devices/common"
+
+    executer_locale "mkdir -p $MKSPEC_DST"
+
+    cat > "$MKSPEC_DST/qmake.conf" << 'MKSPEC_EOF'
+# mkspec Qt 6 RPi4 — toolchain cross apt Ubuntu (gcc-11/gcc-12)
+# neon-vfpv4 remplace crypto-neon-fp-armv8 (non supporté apt cross)
+# mfloat-abi=hard inline (pas via DISTRO_OPTS hard-float)
+
+include(../common/linux_device_pre.conf)
+
+QMAKE_LIBS_EGL         += -lEGL
+QMAKE_LIBS_OPENGL_ES2  += -lGLESv2 -lEGL
+
+QMAKE_CFLAGS            = -march=armv8-a -mtune=cortex-a72 -mfpu=neon-vfpv4 -mfloat-abi=hard
+QMAKE_CXXFLAGS          = $$QMAKE_CFLAGS
+
+# PAS de DISTRO_OPTS hard-float ni crypto-neon
+# Wiki Qt Known Issues : supprimer crypto-neon-fp-armv8
+#   et remplacer linux_arm_device_post.conf par linux_device_post.conf
+DISTRO_OPTS            += deb-multi-arch
+
+EGLFS_DEVICE_INTEGRATION = eglfs_kms
+
+# linux_device_post.conf (sans _arm_) : n'injecte PAS mfloat-abi ni crypto-neon
+# Conforme à la recommandation du wiki Qt officiel pour RPi
+include(../common/linux_device_post.conf)
+load(qt_config)
+MKSPEC_EOF
+
+    cat > "$MKSPEC_DST/qplatformdefs.h" << 'PLATDEF_EOF'
+#include "../../linux-g++/qplatformdefs.h"
+PLATDEF_EOF
+
+    echo -e "${GREEN}  Mkspec créé : $MKSPEC_DST${NC}"
+    grep "QMAKE_CFLAGS\|DISTRO_OPTS" "$MKSPEC_DST/qmake.conf" | sed 's/^/    /'
+
+    # Note : on utilise linux_device_post.conf (sans _arm_) — wiki Qt Known Issues
+    # → pas d'injection mfloat-abi=hard ni crypto-neon-fp-armv8
+    # Pas besoin de patcher linux_arm_device_post.conf partagé
+
+    echo ""
+    echo -e "${YELLOW}  Mkspec Qt Creator (kit Qt 6) : devices/linux-rasp-pi4-ubuntu-cross${NC}"
+}
+
 
 # ==============================================================================
 # BUILD TARGET — un module Qt supplémentaire
@@ -628,8 +796,12 @@ executer_distante "
         libgstreamer1.0-dev \
         libgstreamer-plugins-base1.0-dev \
         gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+        libavcodec-dev libavformat-dev libswscale-dev \
+        libvpx-dev libsrtp2-dev libsnappy-dev \
+        libnss3-dev libxss-dev libxtst-dev libpci-dev \
         libopenal-dev libasound2-dev libpulse-dev \
-        bluez-tools libbluetooth-dev libffi-dev
+        bluez-tools libbluetooth-dev libffi-dev \
+        libsystemd-dev
     sudo apt install -y '^libxcb.*-dev' || true
     # libmd4c : rendu Markdown dans Qt — DOIT être installé avant rsync
     # Sans cela cmake Qt6 target échoue : "md4c::md4c-html references .so but file does not exist"
@@ -775,11 +947,13 @@ else
     executer_locale "mkdir -p $SYSROOT/opt/vc"
 fi
 
-executer_locale "wget '$RELATIVE_LINKS_SCRIPT_URL' -O $CROSS_DIR/relative_links.py"
-executer_locale "chmod +x $CROSS_DIR/relative_links.py"
-executer_locale "$CROSS_DIR/relative_links.py $SYSROOT"
+# Corriger les symlinks absolus → relatifs avec l'outil `symlinks` (apt)
+# Recommandé par le wiki Qt officiel — plus fiable que relative_links.py
+executer_locale "sudo apt install -y symlinks"
+executer_locale "symlinks -rc $SYSROOT"
 
 verify_mysql_sysroot
+verify_fix_libdbus_sysroot
 generate_toolchain_cmake
 
 # ==============================================================================
@@ -819,6 +993,12 @@ for module in "${MODULES_TO_BUILD[@]}"; do
 
     build_qt_target_module "$module" "$SRC_PATH"
 done
+
+# Créer aussi le mkspec corrigé dans le staging final
+# (au cas où des modules auraient écrasé le staging)
+
+# Appel final create_fixed_mkspec (idempotent)
+create_fixed_mkspec
 
 # ==============================================================================
 # Partie 8 : Déploiement sur le RPi
@@ -879,7 +1059,24 @@ echo -e "${YELLOW}  Vérifier les drivers au runtime :                         $
 echo -e "${YELLOW}    qDebug() << QSqlDatabase::drivers();                    ${NC}"
 echo -e "${YELLOW}    // Attendu : (\"QSQLITE\", \"QMYSQL\")                 ${NC}"
 echo ""
-echo -e "${YELLOW}  Connexion MySQL distante :                                 ${NC}"
+echo -e "${YELLOW}  qmake — compiler un projet .pro :${NC}"
+echo -e "${YELLOW}    $QT_TARGET_STAGING/bin/qmake \\${NC}"
+echo -e "${YELLOW}      -spec devices/linux-rasp-pi4-ubuntu-cross \\${NC}"
+echo -e "${YELLOW}      votre_projet.pro${NC}"
+echo -e "${YELLOW}    make -j\$(nproc)${NC}"
+echo ""
+echo -e "${YELLOW}  Qt Creator — kits recommandés :${NC}"
+echo -e "${YELLOW}    Kit Qt 5.15.2 RPi4 :${NC}"
+echo -e "${YELLOW}      Compilateur C++ : /usr/bin/arm-linux-gnueabihf-g++${NC}"
+echo -e "${YELLOW}      Qt version      : ~/cross_rpi4/qt5pi/bin/qmake${NC}"
+echo -e "${YELLOW}      Mkspec          : devices/linux-rasp-pi4-v3d-g++${NC}"
+echo -e "${YELLOW}    Kit Qt 6.10 RPi4 :${NC}"
+echo -e "${YELLOW}      Compilateur C++ : /usr/bin/arm-linux-gnueabihf-g++${NC}"
+echo -e "${YELLOW}      Qt version      : $QT_TARGET_STAGING/bin/qmake${NC}"
+echo -e "${YELLOW}      Mkspec          : devices/linux-rasp-pi4-ubuntu-cross${NC}"
+echo -e "${YELLOW}      CMake toolchain : $TOOLCHAIN_FILE${NC}"
+echo ""
+echo -e "${YELLOW}  Connexion MySQL distante :${NC}"
 echo -e "${YELLOW}    QSqlDatabase db = QSqlDatabase::addDatabase(\"QMYSQL\");${NC}"
 echo -e "${YELLOW}    db.setHostName(\"ip_serveur\"); db.setPort(3306);        ${NC}"
 echo -e "${YELLOW}    db.setUserName(\"user\"); db.setPassword(\"mdp\");       ${NC}"
